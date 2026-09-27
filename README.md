@@ -74,14 +74,27 @@ Every event is a frozen, extra-forbidding `pydantic.BaseModel` subclassing
 - `recorded_at: datetime | None` - set by `Writer` when the event is written.
 
 **Every `datetime` field is timezone-required and UTC-normalized** - not
-just the two above. A subclass's own `run_at: datetime` or
-`cancelled_at: datetime | None` fields get the same treatment.
+just the two above, and not just scalar fields: a subclass's own
+`run_at: datetime`, `cancelled_at: datetime | None`, or `moments:
+list[datetime]` fields (every element of the list) all get the same
+treatment. A naive `datetime` anywhere in there is a `ValidationError`.
 
 A subclass must declare `event_type: ClassVar[str]` matching
 `^[a-z][a-z0-9_]{0,63}$` (it becomes a directory name, a SQL view name, and
 part of a file glob, so it's kept to a boring, safe charset - no `.`, `/`,
 uppercase, or leading digit). Leaving it out, or giving it a name that
-doesn't match, is a `TypeError` as soon as the class is defined.
+doesn't match, is a `TypeError` as soon as the class is defined. The same
+pattern is enforced on any event_type string handed to `compact()` or the
+CLI directly, and on the partition date (`dt`, `YYYY-MM-DD`) `compact()`
+and the CLI take - both are validated before they're ever used to build a
+filesystem path, so `"../escape"` or a malformed date can't point outside
+the root or write/delete files it shouldn't.
+
+No field may be named starting with `__eventlake` (also a `TypeError` at
+class-definition time) - that prefix is reserved for a synthetic column
+`Lake`/`compact()` add internally to break a rare dedup tie deterministically
+(see "Reading" below); a real field named plain `filename` is unaffected by
+it and round-trips normally.
 
 Supported field types: `str`, `int`, `float`, `bool`, timezone-aware
 `datetime`, `date`, `UUID`, `Enum` subclasses, `list[...]` of any of those
@@ -106,9 +119,13 @@ with Writer(root, max_rows=10_000, allow_breaking=False) as writer:
   reconciled through the normal schema-compatibility rules below - a
   compatible V2 becomes a new version, an incompatible one raises.
 - Files are written to a temp path and renamed into place, so a crash
-  mid-write never leaves a half-written file where a reader could see it. If
-  the write fails, the (now-empty) partition directory it just created is
-  also removed, best-effort.
+  mid-write never leaves a half-written file where a reader could see it -
+  only the temp file is cleaned up on failure. The partition directory
+  itself (possibly now empty, if this `Writer` just created it) is left in
+  place rather than removed: deleting it would race with another `Writer`
+  concurrently targeting the same partition. `Lake` already ignores an
+  event-type directory with no Parquet files in it (see "Reading" below),
+  so an empty one left behind like this is harmless.
 - If a flush spans multiple days (multiple `occurred_at` partitions) and
   fails partway through, the days that were already written are removed
   from the buffer immediately - a later retry only re-attempts what didn't
@@ -174,6 +191,12 @@ correctly raise for whichever one turns out not to fit - concurrent writers
 aren't a way around the compatibility rules above, just a way to not lose a
 version to a lost race.
 
+A schema that exactly matches *any* already-registered version - not just
+the latest one - is written under that version with no compatibility check
+at all, so mixing two classes' flushes for the same `event_type` is
+order-independent: if v1 and v2 are both already registered, flushing a v2
+event and then a v1 event both succeed, regardless of which is "latest".
+
 ### Reading (`eventlake.lake.Lake`)
 
 ```python
@@ -188,11 +211,13 @@ lake.describe()  # per-type schema/partition/file/row counts
 - `events()` only reads the Parquet partitions that fall inside
   `[since, until]`, and deduplicates by `event_id`, keeping the copy with the
   earliest `recorded_at`. Ties on `recorded_at` are broken by the source
-  Parquet filename - not `event_id`, which is constant across every row in
-  that tiebreak window and so can't distinguish anything - a deterministic
-  but otherwise meaningless fallback that only matters when two writes
-  landed at the exact same `recorded_at`. This is what catches the
-  cross-`Writer` duplicates that writing doesn't.
+  Parquet file path, read into a column reserved for this purpose under the
+  name `__eventlake_source_file` (see "Events" above for why it isn't just
+  called `filename`) and excluded from the result - not `event_id`, which is
+  constant across every row in that tiebreak window and so can't distinguish
+  anything - a deterministic but otherwise meaningless fallback that only
+  matters when two writes landed at the exact same `recorded_at`. This is
+  what catches the cross-`Writer` duplicates that writing doesn't.
 - Every event type is also available as a same-named SQL view (built with
   the same dedup rule), so arbitrary joins across event types work with
   plain `lake.sql(...)`.
@@ -215,10 +240,13 @@ dependency because DuckDB needs it to hand timezone-aware values to Python.
 Every flush writes a new file, so a busy event type accumulates many small
 files per day. `compact(root, event_type, dt)` merges one partition's files
 into one, dropping duplicate `event_id`s the same way `events()` does
-(earliest `recorded_at`, ties broken by filename). A single-file partition
-with no internal duplicates is left untouched; a single file that *does*
-have duplicate `event_id`s in it (rare, but possible) is still rewritten to
-remove them.
+(earliest `recorded_at`, ties broken by source file - see "Reading" above).
+A single-file partition with no internal duplicates is left untouched; a
+single file that *does* have duplicate `event_id`s in it (rare, but
+possible) is still rewritten to remove them. Both `event_type` and `dt` are
+validated (the same `EVENT_TYPE_PATTERN` rule, and a strict `YYYY-MM-DD` for
+`dt`) before either is used to build a path - `compact(root, "../x", ...)`
+or a malformed `dt` raises `ValueError` rather than touching anything.
 
 It writes the merged file and renames it into place *before* deleting the
 old files, so a crash while writing it never loses rows: either the
@@ -313,12 +341,17 @@ DuckDB で「任意時点の状態」を組み立て直せる小さなデータ�
 アプリの DB は「今の値」を上書きしていくため、過去の値・削除・変更の順序が失われます。
 ML の学習データや分析に必要なのは、まさにその履歴です。eventlake では:
 
-- イベントは `pydantic` の型で検証してから受け付ける。日時フィールドは（ユーザー定義のものも
-  含め）すべてタイムゾーン必須で UTC に正規化し、非対応の型はクラス定義した瞬間にエラーにする
+- イベントは `pydantic` の型で検証してから受け付ける。日時フィールドは（`list[datetime]` の
+  各要素・ユーザー定義のものも含め）すべてタイムゾーン必須で UTC に正規化し、非対応の型は
+  クラス定義した瞬間にエラーにする。`event_type` は安全な文字種のみに制限し、`compact()` や
+  CLI が受け取る `event_type` ・パーティション日付もパスに使う前に同じ規則で検証する
+  （`../` 等でルート外にファイルを作成・削除できないようにする）
 - `occurred_at`（実際に起きた日、書き込んだ日ではない）の UTC 日付でパーティション分割
 - スキーマの変更（フィールド追加・削除・型変更）を書き込み時に検知し、読む側を壊す変更は
   既定で拒否する（`allow_breaking=True` で許可も可能）。バージョン登録は排他制御されており、
-  複数の Writer が同時に書き込んでも版が失われたり壊れたりしない
+  複数の Writer が同時に書き込んでも版が失われたり壊れたりしない。既存のいずれかの版と
+  完全に一致するスキーマは、その版としてそのまま書けるので、同じ event_type の V1/V2 を
+  混ぜて書く順序にも依存しない
 - 読み込みは DuckDB 経由なので、`lake.state_as_of(...)` のような「ある時点の状態」を
   SQL 感覚で問い合わせられる。`since`/`until`/`at` にタイムゾーンなしの日時を渡すとエラーになる
   （暗黙にローカル時刻として扱わない）
