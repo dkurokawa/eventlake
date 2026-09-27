@@ -8,7 +8,12 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from eventlake.schema import SchemaChangeError, SchemaRegistry, diff_schemas
+from eventlake.schema import (
+    SchemaChangeError,
+    SchemaRegistrationRace,
+    SchemaRegistry,
+    diff_schemas,
+)
 
 BASE_SCHEMA = pa.schema(
     [
@@ -148,6 +153,149 @@ def test_registry_all_returns_ordered_versions(tmp_path: Path) -> None:
     assert [v.version for v in versions] == [1, 2]
     assert versions[0].schema.equals(BASE_SCHEMA)
     assert versions[1].schema.equals(new_schema)
+
+
+# --- H3: version files are claimed exclusively, with retry on collision ----
+
+
+def test_write_never_overwrites_an_existing_version_file(tmp_path: Path) -> None:
+    registry = SchemaRegistry(tmp_path)
+    registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
+
+    # v1 already exists: a second _write for the same version must fail
+    # instead of silently overwriting it.
+    with pytest.raises(FileExistsError):
+        registry._write("widget", 1, BASE_SCHEMA)
+
+    # Simulate a v2.json that already exists (e.g. another process claimed
+    # it) with content the registry has no in-memory knowledge of yet:
+    # a same-version _write of different content must still fail, not clobber it.
+    concurrent_schema = BASE_SCHEMA.append(pa.field("other", pa.string(), nullable=True))
+    registry._write("widget", 2, concurrent_schema)
+    with pytest.raises(FileExistsError):
+        registry._write("widget", 2, BASE_SCHEMA)
+    assert {f.name for f in registry.load("widget", 2).schema} == {
+        f.name for f in concurrent_schema
+    }
+
+
+def test_register_retries_when_target_version_already_exists(tmp_path: Path) -> None:
+    registry = SchemaRegistry(tmp_path)
+    registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
+
+    concurrent_schema = BASE_SCHEMA.append(pa.field("other", pa.string(), nullable=True))
+    real_write = SchemaRegistry._write
+    call_count = {"n": 0}
+
+    def flaky_write(
+        self: SchemaRegistry, event_type: str, version: int, schema: pa.Schema
+    ) -> object:
+        call_count["n"] += 1
+        if call_count["n"] == 1 and version == 2:
+            # Someone else wins the race for v2 first, with a schema we
+            # didn't know about when we decided our own candidate was v2.
+            real_write(self, event_type, 2, concurrent_schema)
+            raise FileExistsError("simulated concurrent winner")
+        return real_write(self, event_type, version, schema)
+
+    registry._write = flaky_write.__get__(registry, SchemaRegistry)  # type: ignore[method-assign]
+
+    # Our schema happens to already be a compatible extension of whatever
+    # ends up as the new v2 (this is what makes a clean retry possible -
+    # see the docstring on SchemaRegistrationRace for the case where it isn't).
+    our_schema = concurrent_schema.append(pa.field("mine", pa.string(), nullable=True))
+    result = registry.register("widget", our_schema, allow_breaking=False)
+
+    assert call_count["n"] == 2
+    assert result.version == 3
+    assert registry.versions("widget") == [1, 2, 3]
+    v2 = registry.load("widget", 2)
+    assert {f.name for f in v2.schema} == {f.name for f in concurrent_schema}
+    v3 = registry.load("widget", 3)
+    assert {f.name for f in v3.schema} >= {"other", "mine"}
+
+
+def test_register_gives_up_after_max_attempts_under_permanent_contention(
+    tmp_path: Path,
+) -> None:
+    registry = SchemaRegistry(tmp_path)
+    registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
+
+    def always_taken(
+        self: SchemaRegistry, event_type: str, version: int, schema: pa.Schema
+    ) -> object:
+        raise FileExistsError("always contended")
+
+    registry._write = always_taken.__get__(registry, SchemaRegistry)  # type: ignore[method-assign]
+
+    new_schema = BASE_SCHEMA.append(pa.field("note", pa.string(), nullable=True))
+    with pytest.raises(SchemaRegistrationRace, match="widget"):
+        registry.register("widget", new_schema, allow_breaking=False)
+
+
+def test_two_threads_registering_different_compatible_schemas_lose_nothing(
+    tmp_path: Path,
+) -> None:
+    """A real concurrency test: two threads race to claim v2 for real."""
+    import threading
+
+    registry = SchemaRegistry(tmp_path)
+    registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
+
+    schema_a = BASE_SCHEMA.append(pa.field("a", pa.string(), nullable=True))
+    schema_ab = schema_a.append(pa.field("b", pa.string(), nullable=True))
+
+    real_write = SchemaRegistry._write
+    barrier = threading.Barrier(2)
+    seen_threads: set[int] = set()
+    seen_lock = threading.Lock()
+
+    def synced_write(
+        self: SchemaRegistry, event_type: str, version: int, schema: pa.Schema
+    ) -> object:
+        tid = threading.get_ident()
+        with seen_lock:
+            is_first_call_for_thread = tid not in seen_threads
+            seen_threads.add(tid)
+        if is_first_call_for_thread:
+            barrier.wait(timeout=5)
+            # schema_ab's thread yields briefly so schema_a's thread wins
+            # the real filesystem race deterministically; schema_ab is a
+            # compatible superset of schema_a, so its retry (as v3) succeeds.
+            if {f.name for f in schema} == {f.name for f in schema_ab}:
+                import time
+
+                time.sleep(0.05)
+        return real_write(self, event_type, version, schema)
+
+    registry._write = synced_write.__get__(registry, SchemaRegistry)  # type: ignore[method-assign]
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+    results_lock = threading.Lock()
+
+    def run(schema: pa.Schema) -> None:
+        try:
+            result = registry.register("widget", schema, allow_breaking=False)
+            with results_lock:
+                results.append(result)
+        except BaseException as exc:  # noqa: BLE001
+            with results_lock:
+                errors.append(exc)
+
+    t_a = threading.Thread(target=run, args=(schema_a,))
+    t_ab = threading.Thread(target=run, args=(schema_ab,))
+    t_a.start()
+    t_ab.start()
+    t_a.join(timeout=10)
+    t_ab.join(timeout=10)
+
+    assert not errors, errors
+    assert registry.versions("widget") == [1, 2, 3]
+    v2 = registry.load("widget", 2)
+    v3 = registry.load("widget", 3)
+    assert {f.name for f in v2.schema} == {f.name for f in schema_a}
+    assert {f.name for f in v3.schema} == {f.name for f in schema_ab}
 
 
 # --- Property-based tests (hypothesis) -------------------------------------

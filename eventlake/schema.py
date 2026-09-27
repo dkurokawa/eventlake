@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +19,10 @@ from pathlib import Path
 import pyarrow as pa
 
 logger = logging.getLogger(__name__)
+
+# How many times register() will re-read the latest version and retry after
+# losing a race to claim the next version number, before giving up.
+_MAX_REGISTER_ATTEMPTS = 10
 
 _TYPE_TOKENS: dict[str, pa.DataType] = {
     "string": pa.string(),
@@ -141,6 +147,24 @@ class SchemaChangeError(Exception):
         super().__init__(f"incompatible schema change for {event_type!r}:\n{diff.describe()}")
 
 
+class SchemaRegistrationRace(Exception):
+    """Raised when concurrent writers can't agree on a schema version.
+
+    register() retries (re-reading the latest version and re-diffing) when
+    it loses a race to claim the next version number, but only up to
+    _MAX_REGISTER_ATTEMPTS times - this is what fires if contention is high
+    enough that it never wins.
+    """
+
+    def __init__(self, event_type: str, attempts: int) -> None:
+        self.event_type = event_type
+        self.attempts = attempts
+        super().__init__(
+            f"could not register a schema version for {event_type!r} after "
+            f"{attempts} attempts (too much concurrent contention)"
+        )
+
+
 @dataclass(frozen=True)
 class SchemaVersion:
     version: int
@@ -198,23 +222,52 @@ class SchemaRegistry:
 
         Returns the version to write under. Raises SchemaChangeError if the
         schema is a breaking change and `allow_breaking` is False.
+
+        Safe to call concurrently from multiple processes/threads against
+        the same root: claiming a version number is exclusive (a version
+        file is never overwritten), so a writer that loses the race to
+        claim version N simply re-reads the (now updated) latest version
+        and redoes the diff against it, up to _MAX_REGISTER_ATTEMPTS times.
         """
-        current = self.latest(event_type)
-        if current is None:
-            return self._write(event_type, 1, schema)
+        for _attempt in range(_MAX_REGISTER_ATTEMPTS):
+            current = self.latest(event_type)
 
-        diff = diff_schemas(current.schema, schema)
-        if diff.is_empty():
-            return current
-        if diff.is_compatible():
-            return self._write(event_type, current.version + 1, schema)
-        if not allow_breaking:
-            raise SchemaChangeError(event_type, diff)
+            if current is None:
+                try:
+                    return self._write(event_type, 1, schema)
+                except FileExistsError:
+                    continue
 
-        logger.warning("breaking schema change for %s:\n%s", event_type, diff.describe())
-        return self._write(event_type, current.version + 1, schema)
+            diff = diff_schemas(current.schema, schema)
+            if diff.is_empty():
+                return current
+
+            if diff.is_compatible():
+                try:
+                    return self._write(event_type, current.version + 1, schema)
+                except FileExistsError:
+                    continue
+
+            if not allow_breaking:
+                raise SchemaChangeError(event_type, diff)
+
+            logger.warning("breaking schema change for %s:\n%s", event_type, diff.describe())
+            try:
+                return self._write(event_type, current.version + 1, schema)
+            except FileExistsError:
+                continue
+
+        raise SchemaRegistrationRace(event_type, _MAX_REGISTER_ATTEMPTS)
 
     def _write(self, event_type: str, version: int, schema: pa.Schema) -> SchemaVersion:
+        """Exclusively create `v<version>.json`, or raise FileExistsError.
+
+        Writes the full content to a uniquely-named temp file first, then
+        atomically claims the target name with `os.link` (which fails with
+        FileExistsError if the target already exists, and never overwrites
+        it) - so a reader only ever sees the target absent or complete, and
+        two concurrent callers can't silently clobber each other's version.
+        """
         directory = self._dir(event_type)
         directory.mkdir(parents=True, exist_ok=True)
         created_at = datetime.now(UTC)
@@ -227,7 +280,10 @@ class SchemaRegistry:
             ],
         }
         path = directory / f"v{version}.json"
-        tmp_path = directory / f".v{version}.json.tmp"
+        tmp_path = directory / f".v{version}.{uuid.uuid4().hex}.tmp"
         tmp_path.write_text(json.dumps(payload, indent=2))
-        tmp_path.rename(path)
+        try:
+            os.link(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         return SchemaVersion(version=version, schema=schema, created_at=created_at)
