@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,7 +20,14 @@ DEFAULT_MAX_ROWS = 10_000
 
 
 class Writer:
-    """Buffers events per event type and flushes them to Parquet.
+    """Buffers events per event *class* and flushes them to Parquet.
+
+    Buffering is keyed by the Python class, not by `event_type`: if two
+    classes share an event_type (e.g. a V1 and a V2 of the same event,
+    migrated mid-process), each is flushed with its own class's Arrow
+    schema, and schema compatibility between them is resolved through the
+    normal SchemaRegistry rules (a compatible V2 becomes a new version; an
+    incompatible one raises unless allow_breaking is set).
 
     Use as a context manager so buffered events are flushed on exit::
 
@@ -38,7 +46,7 @@ class Writer:
         self._max_rows = max_rows
         self._allow_breaking = allow_breaking
         self._registry = SchemaRegistry(self._root)
-        self._buffers: dict[str, list[Event]] = defaultdict(list)
+        self._buffers: dict[type[Event], list[Event]] = defaultdict(list)
         self._seen_event_ids: set[uuid.UUID] = set()
         self._closed = False
 
@@ -66,35 +74,49 @@ class Writer:
                 continue
             self._seen_event_ids.add(event.event_id)
             recorded = event.model_copy(update={"recorded_at": datetime.now(UTC)})
-            event_type = type(recorded).event_type
-            self._buffers[event_type].append(recorded)
-            if len(self._buffers[event_type]) >= self._max_rows:
-                self._flush_type(event_type)
+            cls = type(recorded)
+            self._buffers[cls].append(recorded)
+            if len(self._buffers[cls]) >= self._max_rows:
+                self._flush_class(cls)
 
     def flush(self) -> None:
-        for event_type in list(self._buffers.keys()):
-            self._flush_type(event_type)
+        for cls in list(self._buffers.keys()):
+            self._flush_class(cls)
 
-    def _flush_type(self, event_type: str) -> None:
-        buffer = self._buffers.get(event_type)
+    def _flush_class(self, cls: type[Event]) -> None:
+        buffer = self._buffers.get(cls)
         if not buffer:
             return
-        cls = type(buffer[0])
+        event_type = cls.event_type
         schema = arrow_schema_for(cls)
         # May raise SchemaChangeError; buffer stays intact if it does.
         self._registry.register(event_type, schema, allow_breaking=self._allow_breaking)
-        table = pa.Table.from_pylist([event_to_record(e) for e in buffer], schema=schema)
-        self._write_partitions(event_type, table, buffer)
-        self._buffers[event_type] = []
+        self._write_partitions(cls, event_type, schema, buffer)
 
-    def _write_partitions(self, event_type: str, table: pa.Table, events: list[Event]) -> None:
-        groups: dict[str, list[int]] = defaultdict(list)
-        for index, event in enumerate(events):
+    def _write_partitions(
+        self, cls: type[Event], event_type: str, schema: pa.Schema, events: list[Event]
+    ) -> None:
+        """Write one file per occurred_at day, removing each day's events
+        from the buffer as soon as its file is safely on disk.
+
+        If writing a later day's partition fails, the earlier days already
+        written are gone from the buffer - a retry (another flush() call)
+        only re-attempts what didn't make it, instead of writing duplicate
+        files for partitions that already succeeded.
+        """
+        groups: dict[str, list[Event]] = defaultdict(list)
+        for event in events:
             dt = event.occurred_at.astimezone(UTC).date().isoformat()
-            groups[dt].append(index)
-        for dt, indices in groups.items():
-            partition_table = table.take(pa.array(indices))
-            self._write_file(event_type, dt, partition_table)
+            groups[dt].append(event)
+
+        remaining = list(events)
+        self._buffers[cls] = remaining
+        for dt, dt_events in groups.items():
+            table = pa.Table.from_pylist([event_to_record(e) for e in dt_events], schema=schema)
+            self._write_file(event_type, dt, table)
+            written_ids = {e.event_id for e in dt_events}
+            remaining = [e for e in remaining if e.event_id not in written_ids]
+            self._buffers[cls] = remaining
 
     def _write_file(self, event_type: str, dt: str, table: pa.Table) -> None:
         partition_dir = self._root / event_type / f"dt={dt}"
@@ -107,4 +129,7 @@ class Writer:
             tmp_path.rename(final_path)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                if not any(partition_dir.iterdir()):
+                    partition_dir.rmdir()
             raise

@@ -182,6 +182,127 @@ def test_exception_during_write_leaves_no_partial_file(
         writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
         writer.flush()
 
+    # M1: the writer created this partition dir itself for this failed
+    # write; it should clean the now-empty dir up (best-effort), not just
+    # the tmp file inside it.
     partition_dir = tmp_path / "ping" / "dt=2026-01-01"
-    if partition_dir.exists():
-        assert list(partition_dir.iterdir()) == []
+    assert not partition_dir.exists()
+
+
+def test_failed_write_does_not_remove_a_partition_dir_with_other_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A partition dir that already has a file in it (from an earlier,
+    # successful write) must survive a later failed write to the same
+    # partition - only an empty dir is a cleanup candidate.
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    import pyarrow.parquet
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(pyarrow.parquet, "write_table", boom)
+
+    writer = Writer(tmp_path)
+    with pytest.raises(RuntimeError, match="disk full"):
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="b"))
+        writer.flush()
+
+    partition_dir = tmp_path / "ping" / "dt=2026-01-01"
+    assert partition_dir.exists()
+    assert len(list(partition_dir.glob("part-*.parquet"))) == 1
+
+
+def test_same_event_type_different_classes_v1_then_v2_in_one_writer(tmp_path: Path) -> None:
+    """H1: buffering is per-class, so a V1/V2 mix in one Writer resolves
+    through the normal per-event_type schema rules, not a single merged one."""
+
+    class PingV1(Event):
+        event_type: ClassVar[str] = "ping"
+
+        source: str
+
+    class PingV2(Event):
+        event_type: ClassVar[str] = "ping"
+
+        source: str
+        note: str | None = None
+
+    with Writer(tmp_path) as writer:
+        writer.write(PingV1(occurred_at=utc(2026, 1, 1), source="a"))
+        writer.write(PingV2(occurred_at=utc(2026, 1, 2), source="b", note="hi"))
+
+    from eventlake.schema import SchemaRegistry
+
+    registry = SchemaRegistry(tmp_path)
+    assert registry.versions("ping") == [1, 2]
+
+    from eventlake.lake import Lake
+
+    table = Lake(tmp_path).events("ping").to_arrow_table()
+    assert table.num_rows == 2
+    sources = table.column("source").to_pylist()
+    notes = table.column("note").to_pylist()
+    by_source = dict(zip(sources, notes, strict=True))
+    assert by_source == {"a": None, "b": "hi"}
+
+
+def test_same_event_type_different_classes_incompatible_raises(tmp_path: Path) -> None:
+    class PingV1(Event):
+        event_type: ClassVar[str] = "ping"
+
+        source: str
+
+    class PingBrokenV2(Event):
+        event_type: ClassVar[str] = "ping"
+
+        note: str  # `source` dropped, `note` required: breaking
+
+    # Not a `with` block: exiting it would call flush() again and re-raise,
+    # same reasoning as test_incompatible_schema_change_raises_and_keeps_buffer.
+    writer = Writer(tmp_path)
+    writer.write(PingV1(occurred_at=utc(2026, 1, 1), source="a"))
+    writer.write(PingBrokenV2(occurred_at=utc(2026, 1, 2), note="hi"))
+    with pytest.raises(SchemaChangeError):
+        writer.flush()
+
+
+def test_partial_multiday_flush_failure_does_not_duplicate_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good_event = Ping(occurred_at=utc(2026, 1, 1), source="a")
+    bad_event = Ping(occurred_at=utc(2026, 1, 2), source="b")
+
+    writer = Writer(tmp_path)
+    writer.write(good_event)
+    writer.write(bad_event)
+
+    original_write_file = Writer._write_file
+
+    def flaky(self: Writer, event_type: str, dt: str, table: object) -> None:
+        if dt == "2026-01-02":
+            raise RuntimeError("boom")
+        original_write_file(self, event_type, dt, table)
+
+    monkeypatch.setattr(Writer, "_write_file", flaky)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        writer.flush()
+
+    files_01 = list((tmp_path / "ping" / "dt=2026-01-01").glob("part-*.parquet"))
+    assert len(files_01) == 1
+
+    # The 2026-01-01 event must be gone from the buffer (already written);
+    # only the 2026-01-02 event should still be pending.
+    remaining = [e for buf in writer._buffers.values() for e in buf]
+    assert [e.event_id for e in remaining] == [bad_event.event_id]
+
+    monkeypatch.setattr(Writer, "_write_file", original_write_file)
+    writer.flush()
+
+    files_01_after = list((tmp_path / "ping" / "dt=2026-01-01").glob("part-*.parquet"))
+    files_02_after = list((tmp_path / "ping" / "dt=2026-01-02").glob("part-*.parquet"))
+    assert len(files_01_after) == 1  # unchanged - not duplicated
+    assert len(files_02_after) == 1
