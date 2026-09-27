@@ -86,3 +86,13 @@ def test_schema_command_shows_versions_and_diff(
 def test_main_requires_a_command(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         main([])
+
+
+def test_compact_command_rejects_unsafe_event_type(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid event_type"):
+        main(["compact", str(tmp_path), "../escape", "2026-01-01"])
+
+
+def test_schema_command_rejects_unsafe_event_type(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid event_type"):
+        main(["schema", str(tmp_path), "/abs/path"])
