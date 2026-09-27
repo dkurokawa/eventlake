@@ -31,6 +31,15 @@ _PRIMITIVE_ARROW_TYPES: dict[type, pa.DataType] = {
 # lowercase, starts with a letter, no path separators or dots.
 EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
+# Reserved for eventlake's own internal use - no Event field may start with
+# this prefix (checked at class-definition time). RESERVED_SOURCE_FILE_COLUMN
+# is the concrete case: Lake and compact() add a synthetic column under this
+# name (via DuckDB's read_parquet(..., filename=<name>)) to break dedup ties
+# deterministically; a user field named plain "filename" must not collide
+# with it, which is why the reserved name isn't just "filename".
+RESERVED_FIELD_PREFIX = "__eventlake"
+RESERVED_SOURCE_FILE_COLUMN = "__eventlake_source_file"
+
 
 class UnsupportedFieldType(TypeError):
     """Raised when an Event field has a type with no Arrow mapping."""
@@ -62,15 +71,31 @@ def _normalize_tz(value: datetime, field_name: str) -> datetime:
     return value.astimezone(UTC)
 
 
-def _is_datetime_annotation(annotation: Any) -> bool:
-    """True for `datetime` or `datetime | None`."""
-    if annotation is datetime:
-        return True
+def _unwrap_optional(annotation: Any) -> Any:
+    """Return the non-None member of `X | None`, or `annotation` unchanged."""
     origin = get_origin(annotation)
     if _is_optional_union(origin):
         non_none = [a for a in get_args(annotation) if a is not type(None)]
-        return len(non_none) == 1 and non_none[0] is datetime
-    return False
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
+
+
+def _datetime_field_kind(annotation: Any) -> str | None:
+    """Classify a field annotation for tz normalization purposes.
+
+    Returns "scalar" for `datetime` (optionally wrapped in `| None`),
+    "list" for `list[datetime]` (likewise optionally wrapped), else None.
+    """
+    unwrapped = _unwrap_optional(annotation)
+    if unwrapped is datetime:
+        return "scalar"
+    origin = get_origin(unwrapped)
+    if origin is list:
+        args = get_args(unwrapped)
+        if len(args) == 1 and args[0] is datetime:
+            return "list"
+    return None
 
 
 class Event(BaseModel):
@@ -113,27 +138,46 @@ class Event(BaseModel):
         plain `__init_subclass__`) guarantees has already happened.
         """
         super().__pydantic_init_subclass__(**kwargs)
+        # Checked against the class's own raw __annotations__, not
+        # model_fields: pydantic already excludes any leading-underscore
+        # name from model_fields entirely (treating it as private, not a
+        # field), so a literal `__eventlake_foo: str` in a class body can
+        # never actually reach model_fields - but this guards the same name
+        # arriving through other means (e.g. dynamic class construction)
+        # and documents the reserved prefix as an explicit contract rather
+        # than relying on that pydantic behavior as an implementation detail.
+        for name in cls.__dict__.get("__annotations__", {}):
+            if name.startswith(RESERVED_FIELD_PREFIX):
+                raise TypeError(
+                    f"{cls.__name__}.{name}: field names starting with "
+                    f"{RESERVED_FIELD_PREFIX!r} are reserved for eventlake's own use"
+                )
         arrow_schema_for(cls)
 
     @model_validator(mode="after")
     def _normalize_all_datetime_fields(self) -> Event:
         """Require tz-aware datetimes and normalize them to UTC.
 
-        Applies to `occurred_at`, `recorded_at`, and any datetime field a
-        subclass declares - not just the two eventlake owns. Uses
-        `object.__setattr__` to update the field in place despite the model
-        being frozen; this runs during construction, before the instance is
-        handed back to the caller.
+        Applies to `occurred_at`, `recorded_at`, any datetime field a
+        subclass declares, and every element of a `list[datetime]` field -
+        not just the two eventlake owns. Uses `object.__setattr__` to update
+        the field in place despite the model being frozen; this runs during
+        construction, before the instance is handed back to the caller.
         """
         for name, field_info in type(self).model_fields.items():
-            if not _is_datetime_annotation(field_info.annotation):
+            kind = _datetime_field_kind(field_info.annotation)
+            if kind is None:
                 continue
             value = getattr(self, name)
             if value is None:
                 continue
-            normalized = _normalize_tz(value, name)
-            if normalized is not value:
-                object.__setattr__(self, name, normalized)
+            if kind == "scalar":
+                object.__setattr__(self, name, _normalize_tz(value, name))
+            else:
+                normalized_list = [
+                    _normalize_tz(item, f"{name}[{i}]") for i, item in enumerate(value)
+                ]
+                object.__setattr__(self, name, normalized_list)
         return self
 
 

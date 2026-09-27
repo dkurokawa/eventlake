@@ -153,6 +153,55 @@ def test_user_defined_datetime_field_requires_tz_and_normalizes() -> None:
     assert event2.cancelled_at is None
 
 
+def test_list_of_datetime_requires_tz_on_every_element_and_normalizes() -> None:
+    class Timeline(Event):
+        event_type: ClassVar[str] = "timeline"
+
+        moments: list[datetime]
+        maybe_moments: list[datetime] | None = None
+
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        Timeline(
+            occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+            moments=[datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2)],  # 2nd naive
+        )
+
+    jst = timezone(timedelta(hours=9))
+    event = Timeline(
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        moments=[datetime(2026, 1, 2, 9, 0, tzinfo=jst), datetime(2026, 1, 3, tzinfo=UTC)],
+        maybe_moments=[datetime(2026, 1, 4, 9, 0, tzinfo=jst)],
+    )
+    assert event.moments == [
+        datetime(2026, 1, 2, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 3, 0, 0, tzinfo=UTC),
+    ]
+    assert all(m.tzinfo == UTC for m in event.moments)
+    assert event.maybe_moments == [datetime(2026, 1, 4, 0, 0, tzinfo=UTC)]
+
+    # Optional list left as None must stay None, not raise.
+    event2 = Timeline(
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        moments=[datetime(2026, 1, 1, tzinfo=UTC)],
+    )
+    assert event2.maybe_moments is None
+
+
+def test_reserved_field_prefix_rejected_at_class_definition_time() -> None:
+    with pytest.raises(TypeError, match="reserved for eventlake's own use"):
+        type(
+            "BadReservedField",
+            (Event,),
+            {
+                "__annotations__": {
+                    "event_type": ClassVar[str],
+                    "__eventlake_source_file": str,
+                },
+                "event_type": "bad_reserved_field",
+            },
+        )
+
+
 def test_event_id_defaults_to_uuid4() -> None:
     a = make_kitchen()
     b = make_kitchen()
