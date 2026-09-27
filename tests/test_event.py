@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import enum
+import uuid
+from datetime import UTC, date, datetime, timedelta, timezone
+from typing import ClassVar
+
+import pyarrow as pa
+import pytest
+from pydantic import ValidationError
+
+from eventlake.event import Event, UnsupportedFieldType, arrow_schema_for, event_to_record
+
+
+class Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class Kitchen(Event):
+    event_type: ClassVar[str] = "kitchen"
+
+    name: str
+    quantity: int
+    price: float
+    in_stock: bool
+    expires_on: date
+    batch_id: uuid.UUID
+    color: Color
+    tags: list[str]
+    note: str | None = None
+
+
+def make_kitchen(**overrides: object) -> Kitchen:
+    defaults: dict[str, object] = dict(
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        name="apple",
+        quantity=3,
+        price=1.5,
+        in_stock=True,
+        expires_on=date(2026, 6, 1),
+        batch_id=uuid.uuid4(),
+        color=Color.RED,
+        tags=["fruit", "fresh"],
+    )
+    defaults.update(overrides)
+    return Kitchen(**defaults)
+
+
+def test_event_type_required() -> None:
+    with pytest.raises(TypeError, match="event_type"):
+
+        class Missing(Event):
+            pass
+
+
+def test_event_type_must_be_str() -> None:
+    with pytest.raises(TypeError, match="must be a str"):
+
+        class NotStr(Event):
+            event_type: ClassVar[str] = 123  # type: ignore[assignment]
+
+
+def test_occurred_at_requires_tz() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        make_kitchen(occurred_at=datetime(2026, 1, 1))
+
+
+def test_occurred_at_normalized_to_utc() -> None:
+    jst = timezone(timedelta(hours=9))
+    event = make_kitchen(occurred_at=datetime(2026, 1, 1, 9, 0, tzinfo=jst))
+    assert event.occurred_at == datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    assert event.occurred_at.tzinfo == UTC
+
+
+def test_recorded_at_requires_tz_when_set() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        make_kitchen(recorded_at=datetime(2026, 1, 1))
+
+
+def test_recorded_at_defaults_to_none() -> None:
+    event = make_kitchen()
+    assert event.recorded_at is None
+
+
+def test_event_id_defaults_to_uuid4() -> None:
+    a = make_kitchen()
+    b = make_kitchen()
+    assert isinstance(a.event_id, uuid.UUID)
+    assert a.event_id != b.event_id
+
+
+def test_extra_fields_forbidden() -> None:
+    with pytest.raises(ValidationError):
+        make_kitchen(unexpected_field="nope")
+
+
+def test_events_are_frozen() -> None:
+    event = make_kitchen()
+    with pytest.raises(ValidationError):
+        event.name = "banana"  # type: ignore[misc]
+
+
+def test_arrow_schema_for_maps_supported_types() -> None:
+    schema = arrow_schema_for(Kitchen)
+    by_name = {f.name: f for f in schema}
+
+    assert by_name["event_id"].type.equals(pa.string())
+    assert not by_name["event_id"].nullable
+
+    assert by_name["occurred_at"].type.equals(pa.timestamp("us", tz="UTC"))
+    assert not by_name["occurred_at"].nullable
+
+    assert by_name["recorded_at"].type.equals(pa.timestamp("us", tz="UTC"))
+    assert by_name["recorded_at"].nullable
+
+    assert by_name["name"].type.equals(pa.string())
+    assert by_name["quantity"].type.equals(pa.int64())
+    assert by_name["price"].type.equals(pa.float64())
+    assert by_name["in_stock"].type.equals(pa.bool_())
+    assert by_name["expires_on"].type.equals(pa.date32())
+    assert by_name["batch_id"].type.equals(pa.string())
+    assert by_name["color"].type.equals(pa.string())
+    assert by_name["tags"].type.equals(pa.list_(pa.string()))
+
+    assert by_name["note"].type.equals(pa.string())
+    assert by_name["note"].nullable
+
+
+def test_arrow_schema_field_order_matches_declaration() -> None:
+    schema = arrow_schema_for(Kitchen)
+    names = [f.name for f in schema]
+    assert names[:3] == ["event_id", "occurred_at", "recorded_at"]
+    assert names[3:] == [
+        "name",
+        "quantity",
+        "price",
+        "in_stock",
+        "expires_on",
+        "batch_id",
+        "color",
+        "tags",
+        "note",
+    ]
+
+
+def test_unsupported_field_type_dict() -> None:
+    with pytest.raises(UnsupportedFieldType) as exc_info:
+
+        class BadDict(Event):
+            event_type: ClassVar[str] = "bad_dict"
+
+            payload: dict[str, str]
+
+        arrow_schema_for(BadDict)
+
+    assert exc_info.value.field_name == "payload"
+
+
+def test_unsupported_field_type_nested_model() -> None:
+    class Inner(Event):
+        event_type: ClassVar[str] = "inner"
+
+        x: int
+
+    class BadNested(Event):
+        event_type: ClassVar[str] = "bad_nested"
+
+        inner: Inner
+
+    with pytest.raises(UnsupportedFieldType):
+        arrow_schema_for(BadNested)
+
+
+def test_unsupported_field_type_list_of_non_primitive() -> None:
+    class BadListItem(Event):
+        event_type: ClassVar[str] = "bad_list_item"
+
+        batch_ids: list[uuid.UUID]
+
+    with pytest.raises(UnsupportedFieldType):
+        arrow_schema_for(BadListItem)
+
+
+def test_unsupported_field_type_union_of_two_real_types() -> None:
+    class BadUnion(Event):
+        event_type: ClassVar[str] = "bad_union"
+
+        value: int | str
+
+    with pytest.raises(UnsupportedFieldType):
+        arrow_schema_for(BadUnion)
+
+
+def test_event_to_record_converts_uuid_enum_and_list() -> None:
+    batch_id = uuid.uuid4()
+    event = make_kitchen(batch_id=batch_id, color=Color.BLUE, tags=["a", "b"])
+    record = event_to_record(event)
+
+    assert record["batch_id"] == str(batch_id)
+    assert record["color"] == "blue"
+    assert record["tags"] == ["a", "b"]
+    assert record["name"] == "apple"
+    assert record["note"] is None
