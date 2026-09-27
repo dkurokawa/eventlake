@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 
+from .event import EVENT_TYPE_PATTERN
 from .schema import SchemaRegistry
 
 
@@ -29,6 +30,11 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _require_aware(value: datetime | None, name: str) -> None:
+    if value is not None and value.tzinfo is None:
+        raise ValueError(f"{name} must be timezone-aware, got a naive datetime: {value!r}")
+
+
 class Lake:
     """A read-only view over an eventlake root, backed by an in-memory DuckDB."""
 
@@ -44,9 +50,26 @@ class Lake:
             self._create_view(event_type)
 
     def _event_types(self) -> list[str]:
+        """Directory names under root that look like a real, non-empty event type.
+
+        Ignores `_schemas`, anything not matching EVENT_TYPE_PATTERN (so a
+        stray or half-named directory can't shadow it), and any event_type
+        directory that doesn't contain at least one Parquet file yet (an
+        empty `read_parquet(glob)` with no matches raises in DuckDB, so
+        these must never reach `_create_view`).
+        """
         if not self._root.exists():
             return []
-        return sorted(p.name for p in self._root.iterdir() if p.is_dir() and p.name != "_schemas")
+        result = []
+        for p in sorted(self._root.iterdir()):
+            if not p.is_dir() or p.name == "_schemas":
+                continue
+            if not EVENT_TYPE_PATTERN.fullmatch(p.name):
+                continue
+            if not any(p.glob("dt=*/part-*.parquet")):
+                continue
+            result.append(p.name)
+        return result
 
     def _partition_dirs(
         self, event_type: str, *, since: datetime | None, until: datetime | None
@@ -84,21 +107,32 @@ class Lake:
         # hive_partitioning=false: the `dt=` directories are a physical
         # layout detail, not a data column. Without this, DuckDB auto-detects
         # the Hive layout and silently adds a `dt` column to every result.
+        # filename=true: adds a `filename` column, used as the final,
+        # always-distinguishing dedup tiebreak below (event_id is constant
+        # within the PARTITION BY event_id window, so it has no power there;
+        # see _dedup_query).
         file_list = ", ".join(_quote_literal(f) for f in files)
-        return f"read_parquet([{file_list}], union_by_name=true, hive_partitioning=false)"
+        return (
+            f"read_parquet([{file_list}], union_by_name=true, "
+            "hive_partitioning=false, filename=true)"
+        )
 
     def _from_glob_expr(self, event_type: str) -> str:
         pattern = str(self._root / event_type / "dt=*" / "part-*.parquet")
         return (
-            f"read_parquet({_quote_literal(pattern)}, union_by_name=true, hive_partitioning=false)"
+            f"read_parquet({_quote_literal(pattern)}, union_by_name=true, "
+            "hive_partitioning=false, filename=true)"
         )
 
     @staticmethod
     def _dedup_query(from_expr: str) -> str:
+        # event_id is constant within this PARTITION BY, so it cannot break
+        # a tie by itself; recorded_at first (the documented rule: earliest
+        # wins), then filename as a final, always-distinct tiebreak.
         return f"""
-            SELECT * EXCLUDE (__rn) FROM (
+            SELECT * EXCLUDE (__rn, filename) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY event_id ORDER BY recorded_at ASC, event_id ASC
+                    PARTITION BY event_id ORDER BY recorded_at ASC, filename ASC
                 ) AS __rn
                 FROM {from_expr}
             ) WHERE __rn = 1
@@ -130,8 +164,15 @@ class Lake:
         Only reads the Parquet partitions whose dt falls within [since, until]
         (by occurred_at's UTC date). When the same event_id appears more than
         once (e.g. two Writer instances processed overlapping data), the copy
-        with the earliest recorded_at wins; ties are broken by event_id.
+        with the earliest recorded_at wins; ties are broken by source filename
+        (deterministic, but not meaningful - it only matters when recorded_at
+        collides exactly).
+
+        `since`/`until` must be timezone-aware; a naive datetime raises
+        ValueError rather than being silently treated as local time.
         """
+        _require_aware(since, "since")
+        _require_aware(until, "until")
         files = self._partition_files(event_type, since=since, until=until)
         if not files:
             return self._empty_relation(event_type)
@@ -154,7 +195,11 @@ class Lake:
         the greatest occurred_at that is <= `at` (or the greatest occurred_at
         overall, if `at` is None). Ties on occurred_at are broken by the most
         recent recorded_at, then by event_id, so the result is deterministic.
+
+        `at` must be timezone-aware; a naive datetime raises ValueError
+        rather than being silently treated as local time.
         """
+        _require_aware(at, "at")
         files = self._partition_files(event_type, since=None, until=at)
         if not files:
             return self._empty_relation(event_type)

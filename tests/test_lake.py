@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
@@ -214,3 +214,102 @@ def test_describe_reports_versions_partitions_files_rows(tmp_path: Path) -> None
 def test_describe_on_empty_root_returns_empty_list(tmp_path: Path) -> None:
     lake = Lake(tmp_path / "does-not-exist")
     assert lake.describe() == []
+
+
+# --- M1: Lake ignores empty dirs / names that don't look like event types --
+
+
+def test_lake_opens_and_ignores_empty_and_invalid_directories(tmp_path: Path) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    (tmp_path / "empty_type").mkdir()  # valid name, but no files yet
+    (tmp_path / "Invalid-Name").mkdir()  # fails EVENT_TYPE_PATTERN
+    (tmp_path / "empty_type" / "dt=2026-01-01").mkdir(parents=True)  # dir but no parquet file
+
+    lake = Lake(tmp_path)  # must not raise
+    assert {s.event_type for s in lake.describe()} == {"ping"}
+
+
+def test_events_raises_for_naive_since_and_until(tmp_path: Path) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    lake = Lake(tmp_path)
+    with pytest.raises(ValueError, match="since"):
+        lake.events("ping", since=datetime(2026, 1, 1))  # naive, no tzinfo
+    with pytest.raises(ValueError, match="until"):
+        lake.events("ping", until=datetime(2026, 1, 1))
+
+
+def test_state_as_of_raises_for_naive_at(tmp_path: Path) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Reading(occurred_at=utc(2026, 1, 1), sensor_id="s1", value=1.0))
+
+    lake = Lake(tmp_path)
+    with pytest.raises(ValueError, match="at"):
+        lake.state_as_of("reading", key="sensor_id", at=datetime(2026, 1, 1))
+
+
+def test_events_dedup_tiebreak_by_filename_when_recorded_at_ties(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3: when recorded_at ties exactly, dedup falls back to the source
+    parquet filename (event_id can't help - it's constant within the
+    PARTITION BY event_id window)."""
+    import eventlake.writer as writer_module
+
+    event_id = uuid.uuid4()
+    fixed_recorded = utc(2026, 6, 1, 12)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FrozenDatetime:
+            return cls.fromisoformat(fixed_recorded.isoformat())
+
+    monkeypatch.setattr(writer_module, "datetime", FrozenDatetime)
+
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(event_id=event_id, occurred_at=utc(2026, 1, 1), source="first"))
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(event_id=event_id, occurred_at=utc(2026, 1, 1), source="second"))
+
+    lake = Lake(tmp_path)
+    table = lake.events("ping").to_arrow_table()
+    assert table.num_rows == 1
+    # Deterministic (whichever filename sorts first), and repeatable.
+    winner = table.column("source").to_pylist()[0]
+    assert winner in {"first", "second"}
+    table_again = Lake(tmp_path).events("ping").to_arrow_table()
+    assert table_again.column("source").to_pylist()[0] == winner
+
+
+def test_state_as_of_tie_break_by_event_id_when_occurred_and_recorded_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3: state_as_of's own tiebreak (occurred_at, recorded_at, event_id)
+    is exercised even when both occurred_at AND recorded_at are identical -
+    only event_id is left to decide."""
+    import eventlake.writer as writer_module
+
+    fixed_recorded = utc(2026, 6, 1, 12)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> FrozenDatetime:
+            return cls.fromisoformat(fixed_recorded.isoformat())
+
+    monkeypatch.setattr(writer_module, "datetime", FrozenDatetime)
+
+    occurred = utc(2026, 1, 1)
+    low_id = uuid.UUID(int=1)
+    high_id = uuid.UUID(int=2)
+
+    with Writer(tmp_path) as writer:
+        writer.write(Reading(event_id=low_id, occurred_at=occurred, sensor_id="s1", value=1.0))
+        writer.write(Reading(event_id=high_id, occurred_at=occurred, sensor_id="s1", value=2.0))
+
+    lake = Lake(tmp_path)
+    result = lake.state_as_of("reading", key="sensor_id").to_arrow_table()
+    # occurred_at and recorded_at both tie exactly; event_id DESC decides.
+    assert result.column("value").to_pylist() == [2.0]
