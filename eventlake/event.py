@@ -10,13 +10,14 @@ doubles as the on-disk directory name for that kind of event.
 from __future__ import annotations
 
 import enum
+import re
 import types
 import uuid
 from datetime import UTC, date, datetime
 from typing import Any, ClassVar, Union, get_args, get_origin
 
 import pyarrow as pa
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _PRIMITIVE_ARROW_TYPES: dict[type, pa.DataType] = {
     str: pa.string(),
@@ -24,6 +25,11 @@ _PRIMITIVE_ARROW_TYPES: dict[type, pa.DataType] = {
     float: pa.float64(),
     bool: pa.bool_(),
 }
+
+# event_type doubles as an on-disk directory name (and is embedded in SQL
+# view names and file globs), so it's restricted to a safe, boring charset:
+# lowercase, starts with a letter, no path separators or dots.
+EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class UnsupportedFieldType(TypeError):
@@ -35,17 +41,45 @@ class UnsupportedFieldType(TypeError):
         super().__init__(f"field {field_name!r} has unsupported type {annotation!r}")
 
 
+def validate_event_type(event_type: str) -> None:
+    """Raise ValueError if `event_type` doesn't match `EVENT_TYPE_PATTERN`.
+
+    Used both by Event subclasses (at class-definition time, where it's
+    surfaced as a TypeError) and by anything else that takes an event_type
+    string from outside and uses it to build a filesystem path or SQL
+    identifier - `compact()` and the CLI - before that string ever touches
+    a path.
+    """
+    if not EVENT_TYPE_PATTERN.fullmatch(event_type):
+        raise ValueError(
+            f"invalid event_type {event_type!r}: must match {EVENT_TYPE_PATTERN.pattern!r}"
+        )
+
+
 def _normalize_tz(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(UTC)
 
 
+def _is_datetime_annotation(annotation: Any) -> bool:
+    """True for `datetime` or `datetime | None`."""
+    if annotation is datetime:
+        return True
+    origin = get_origin(annotation)
+    if _is_optional_union(origin):
+        non_none = [a for a in get_args(annotation) if a is not type(None)]
+        return len(non_none) == 1 and non_none[0] is datetime
+    return False
+
+
 class Event(BaseModel):
     """Base class for all eventlake events.
 
-    Subclasses must declare a class variable ``event_type: ClassVar[str]``.
-    Instances are frozen (immutable) and reject unknown fields.
+    Subclasses must declare a class variable ``event_type: ClassVar[str]``
+    matching `EVENT_TYPE_PATTERN`. Instances are frozen (immutable) and
+    reject unknown fields. Every `datetime` field (including ones a
+    subclass adds) must be timezone-aware; values are normalized to UTC.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -65,22 +99,46 @@ class Event(BaseModel):
             )
         if not isinstance(declared, str):
             raise TypeError(f"{cls.__name__}.event_type must be a str, got {declared!r}")
+        try:
+            validate_event_type(declared)
+        except ValueError as exc:
+            raise TypeError(f"{cls.__name__}.{exc}") from exc
 
-    @field_validator("occurred_at")
     @classmethod
-    def _validate_occurred_at(cls, value: datetime) -> datetime:
-        return _normalize_tz(value, "occurred_at")
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Fail at class-definition time, not at first write.
 
-    @field_validator("recorded_at")
-    @classmethod
-    def _validate_recorded_at(cls, value: datetime | None) -> datetime | None:
-        if value is None:
-            return None
-        return _normalize_tz(value, "recorded_at")
+        `model_fields` is only fully resolved once pydantic has finished
+        building the subclass, which is exactly what this hook (unlike
+        plain `__init_subclass__`) guarantees has already happened.
+        """
+        super().__pydantic_init_subclass__(**kwargs)
+        arrow_schema_for(cls)
+
+    @model_validator(mode="after")
+    def _normalize_all_datetime_fields(self) -> Event:
+        """Require tz-aware datetimes and normalize them to UTC.
+
+        Applies to `occurred_at`, `recorded_at`, and any datetime field a
+        subclass declares - not just the two eventlake owns. Uses
+        `object.__setattr__` to update the field in place despite the model
+        being frozen; this runs during construction, before the instance is
+        handed back to the caller.
+        """
+        for name, field_info in type(self).model_fields.items():
+            if not _is_datetime_annotation(field_info.annotation):
+                continue
+            value = getattr(self, name)
+            if value is None:
+                continue
+            normalized = _normalize_tz(value, name)
+            if normalized is not value:
+                object.__setattr__(self, name, normalized)
+        return self
 
 
 def _primitive_arrow_type(field_name: str, annotation: Any) -> pa.DataType:
-    """Map a primitive (non-container) annotation to an Arrow type.
+    """Map a scalar (non-container) annotation to an Arrow type.
 
     Raises UnsupportedFieldType for anything not in the supported set:
     str / int / float / bool / datetime / date / UUID / Enum subclass.
@@ -96,13 +154,6 @@ def _primitive_arrow_type(field_name: str, annotation: Any) -> pa.DataType:
     if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
         return pa.string()
     raise UnsupportedFieldType(field_name, annotation)
-
-
-def _list_item_arrow_type(field_name: str, annotation: Any) -> pa.DataType:
-    """Map a `list[...]` item annotation. Only plain primitives are allowed."""
-    if annotation in _PRIMITIVE_ARROW_TYPES:
-        return _PRIMITIVE_ARROW_TYPES[annotation]
-    raise UnsupportedFieldType(field_name, list[annotation])
 
 
 def _is_optional_union(origin: Any) -> bool:
@@ -128,7 +179,9 @@ def _field_arrow_type(field_name: str, annotation: Any) -> tuple[pa.DataType, bo
         item_args = get_args(working)
         if len(item_args) != 1:
             raise UnsupportedFieldType(field_name, annotation)
-        item_type = _list_item_arrow_type(field_name, item_args[0])
+        # Every scalar type we support standalone is also allowed as a list
+        # item (UUID/Enum stored as strings, same as when used directly).
+        item_type = _primitive_arrow_type(field_name, item_args[0])
         return pa.list_(item_type), nullable
 
     return _primitive_arrow_type(field_name, working), nullable

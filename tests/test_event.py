@@ -9,7 +9,14 @@ import pyarrow as pa
 import pytest
 from pydantic import ValidationError
 
-from eventlake.event import Event, UnsupportedFieldType, arrow_schema_for, event_to_record
+from eventlake.event import (
+    EVENT_TYPE_PATTERN,
+    Event,
+    UnsupportedFieldType,
+    arrow_schema_for,
+    event_to_record,
+    validate_event_type,
+)
 
 
 class Color(enum.Enum):
@@ -61,6 +68,41 @@ def test_event_type_must_be_str() -> None:
             event_type: ClassVar[str] = 123  # type: ignore[assignment]
 
 
+@pytest.mark.parametrize(
+    "bad_event_type",
+    [
+        "",
+        "../x",
+        "/abs/path",
+        "_schemas",
+        "Kitchen",
+        "kitchen-event",
+        "kitchen.event",
+        "1kitchen",
+        "a" * 65,
+    ],
+)
+def test_event_type_pattern_rejects_unsafe_names(bad_event_type: str) -> None:
+    with pytest.raises(TypeError, match="invalid event_type"):
+        type(
+            "BadEventType",
+            (Event,),
+            {"__annotations__": {"event_type": ClassVar[str]}, "event_type": bad_event_type},
+        )
+
+
+def test_event_type_pattern_accepts_boundary_names() -> None:
+    assert EVENT_TYPE_PATTERN.fullmatch("a")
+    assert EVENT_TYPE_PATTERN.fullmatch("a" * 64)
+    assert EVENT_TYPE_PATTERN.fullmatch("order_placed_v2")
+    validate_event_type("order_placed_v2")  # does not raise
+
+
+def test_validate_event_type_raises_value_error_directly() -> None:
+    with pytest.raises(ValueError, match="invalid event_type"):
+        validate_event_type("../etc")
+
+
 def test_occurred_at_requires_tz() -> None:
     with pytest.raises(ValidationError, match="timezone-aware"):
         make_kitchen(occurred_at=datetime(2026, 1, 1))
@@ -81,6 +123,34 @@ def test_recorded_at_requires_tz_when_set() -> None:
 def test_recorded_at_defaults_to_none() -> None:
     event = make_kitchen()
     assert event.recorded_at is None
+
+
+def test_user_defined_datetime_field_requires_tz_and_normalizes() -> None:
+    class Scheduled(Event):
+        event_type: ClassVar[str] = "scheduled"
+
+        run_at: datetime
+        cancelled_at: datetime | None = None
+
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        Scheduled(occurred_at=datetime(2026, 1, 1, tzinfo=UTC), run_at=datetime(2026, 1, 2))
+
+    jst = timezone(timedelta(hours=9))
+    event = Scheduled(
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        run_at=datetime(2026, 1, 2, 9, 0, tzinfo=jst),
+        cancelled_at=datetime(2026, 1, 2, 10, 0, tzinfo=jst),
+    )
+    assert event.run_at == datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+    assert event.run_at.tzinfo == UTC
+    assert event.cancelled_at == datetime(2026, 1, 2, 1, 0, tzinfo=UTC)
+
+    # Optional datetime field left as None must stay None, not raise.
+    event2 = Scheduled(
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        run_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    assert event2.cancelled_at is None
 
 
 def test_event_id_defaults_to_uuid4() -> None:
@@ -144,6 +214,25 @@ def test_arrow_schema_field_order_matches_declaration() -> None:
     ]
 
 
+def test_list_supports_every_scalar_type_as_uuid_and_enum_become_strings() -> None:
+    class Batch(Event):
+        event_type: ClassVar[str] = "batch"
+
+        ids: list[uuid.UUID]
+        colors: list[Color]
+        dates: list[date]
+        moments: list[datetime]
+        counts: list[int]
+
+    schema = arrow_schema_for(Batch)
+    by_name = {f.name: f for f in schema}
+    assert by_name["ids"].type.equals(pa.list_(pa.string()))
+    assert by_name["colors"].type.equals(pa.list_(pa.string()))
+    assert by_name["dates"].type.equals(pa.list_(pa.date32()))
+    assert by_name["moments"].type.equals(pa.list_(pa.timestamp("us", tz="UTC")))
+    assert by_name["counts"].type.equals(pa.list_(pa.int64()))
+
+
 def test_unsupported_field_type_dict() -> None:
     with pytest.raises(UnsupportedFieldType) as exc_info:
 
@@ -152,9 +241,18 @@ def test_unsupported_field_type_dict() -> None:
 
             payload: dict[str, str]
 
-        arrow_schema_for(BadDict)
-
     assert exc_info.value.field_name == "payload"
+
+
+def test_unsupported_field_type_is_raised_at_class_definition_time() -> None:
+    # No separate arrow_schema_for() call needed: the class statement itself
+    # must raise, per __pydantic_init_subclass__.
+    with pytest.raises(UnsupportedFieldType):
+
+        class BadAtDefinition(Event):
+            event_type: ClassVar[str] = "bad_at_definition"
+
+            payload: dict[str, str]
 
 
 def test_unsupported_field_type_nested_model() -> None:
@@ -163,33 +261,30 @@ def test_unsupported_field_type_nested_model() -> None:
 
         x: int
 
-    class BadNested(Event):
-        event_type: ClassVar[str] = "bad_nested"
-
-        inner: Inner
-
     with pytest.raises(UnsupportedFieldType):
-        arrow_schema_for(BadNested)
+
+        class BadNested(Event):
+            event_type: ClassVar[str] = "bad_nested"
+
+            inner: Inner
 
 
 def test_unsupported_field_type_list_of_non_primitive() -> None:
-    class BadListItem(Event):
-        event_type: ClassVar[str] = "bad_list_item"
-
-        batch_ids: list[uuid.UUID]
-
     with pytest.raises(UnsupportedFieldType):
-        arrow_schema_for(BadListItem)
+
+        class BadListItem(Event):
+            event_type: ClassVar[str] = "bad_list_item"
+
+            groups: list[list[str]]
 
 
 def test_unsupported_field_type_union_of_two_real_types() -> None:
-    class BadUnion(Event):
-        event_type: ClassVar[str] = "bad_union"
-
-        value: int | str
-
     with pytest.raises(UnsupportedFieldType):
-        arrow_schema_for(BadUnion)
+
+        class BadUnion(Event):
+            event_type: ClassVar[str] = "bad_union"
+
+            value: int | str
 
 
 def test_event_to_record_converts_uuid_enum_and_list() -> None:
