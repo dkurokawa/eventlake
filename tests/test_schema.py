@@ -82,6 +82,23 @@ def test_diff_schemas_tightening_nullability_is_incompatible() -> None:
     assert not diff.is_compatible()
 
 
+def test_registry_rejects_unsafe_event_type_even_called_directly(tmp_path: Path) -> None:
+    """K2: SchemaRegistry validates event_type itself, so calling it
+    directly (bypassing Event's own class-definition-time check) still
+    can't write outside the root."""
+    registry = SchemaRegistry(tmp_path)
+    with pytest.raises(ValueError, match="invalid event_type"):
+        registry.register("../escape", BASE_SCHEMA, allow_breaking=False)
+    with pytest.raises(ValueError, match="invalid event_type"):
+        registry.versions("../escape")
+    with pytest.raises(ValueError, match="invalid event_type"):
+        registry.latest("/abs/path")
+
+    # Nothing should have been written anywhere outside (or even inside) root.
+    assert not (tmp_path.parent / "escape").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_registry_first_registration_creates_v1(tmp_path: Path) -> None:
     registry = SchemaRegistry(tmp_path)
     result = registry.register("widget", BASE_SCHEMA, allow_breaking=False)
@@ -95,6 +112,22 @@ def test_registry_no_change_reuses_version(tmp_path: Path) -> None:
     result = registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     assert result.version == 1
     assert registry.versions("widget") == [1]
+
+
+def test_registry_reuses_an_exact_match_against_an_older_version_not_just_latest(
+    tmp_path: Path,
+) -> None:
+    """K5: registering v1's exact schema again, after v2 already exists and
+    is the latest, must reuse v1 - not diff v1's schema against v2 (which
+    would look like an incompatible field removal) and raise."""
+    registry = SchemaRegistry(tmp_path)
+    registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
+    new_schema = BASE_SCHEMA.append(pa.field("note", pa.string(), nullable=True))
+    registry.register("widget", new_schema, allow_breaking=False)  # v2
+
+    result = registry.register("widget", BASE_SCHEMA, allow_breaking=False)
+    assert result.version == 1
+    assert registry.versions("widget") == [1, 2]  # no new version created
 
 
 def test_registry_compatible_change_creates_new_version(tmp_path: Path) -> None:

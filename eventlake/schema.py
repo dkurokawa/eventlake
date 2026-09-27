@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pyarrow as pa
 
+from .event import validate_event_type
+
 logger = logging.getLogger(__name__)
 
 # How many times register() will re-read the latest version and retry after
@@ -179,6 +181,11 @@ class SchemaRegistry:
         self._root = root
 
     def _dir(self, event_type: str) -> Path:
+        # Every other method funnels through here to turn event_type into a
+        # path, so validating it in this one place protects all of them -
+        # including a direct SchemaRegistry call that bypasses Event's own
+        # class-definition-time check on event_type.
+        validate_event_type(event_type)
         return self._root / "_schemas" / event_type
 
     def versions(self, event_type: str) -> list[int]:
@@ -223,14 +230,31 @@ class SchemaRegistry:
         Returns the version to write under. Raises SchemaChangeError if the
         schema is a breaking change and `allow_breaking` is False.
 
+        A schema that exactly matches *any* already-registered version -
+        not just the latest one - is written under that version, with no
+        compatibility check at all. This is what makes mixing two classes'
+        flushes for the same event_type order-independent: if V1 (registered
+        as v1) and V2 (registered as v2, a compatible extension of v1) are
+        both already known, flushing a V2 event and then a V1 event must not
+        fail just because v1's schema, diffed against the *latest* (v2),
+        looks like it removed a field - v1 already exists exactly as
+        written, so it's reused as-is instead of being re-validated against
+        something else's later version.
+
         Safe to call concurrently from multiple processes/threads against
         the same root: claiming a version number is exclusive (a version
         file is never overwritten), so a writer that loses the race to
-        claim version N simply re-reads the (now updated) latest version
-        and redoes the diff against it, up to _MAX_REGISTER_ATTEMPTS times.
+        claim version N simply re-reads the (now updated) set of versions
+        and redoes this whole check, up to _MAX_REGISTER_ATTEMPTS times.
         """
         for _attempt in range(_MAX_REGISTER_ATTEMPTS):
-            current = self.latest(event_type)
+            existing = self.all(event_type)
+
+            for version in existing:
+                if diff_schemas(version.schema, schema).is_empty():
+                    return version
+
+            current = existing[-1] if existing else None
 
             if current is None:
                 try:
@@ -239,8 +263,6 @@ class SchemaRegistry:
                     continue
 
             diff = diff_schemas(current.schema, schema)
-            if diff.is_empty():
-                return current
 
             if diff.is_compatible():
                 try:
