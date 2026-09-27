@@ -38,6 +38,7 @@ EVENT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 # deterministically; a user field named plain "filename" must not collide
 # with it, which is why the reserved name isn't just "filename".
 RESERVED_FIELD_PREFIX = "__eventlake"
+_MANAGED_FIELDS = frozenset({"event_id", "occurred_at", "recorded_at"})
 RESERVED_SOURCE_FILE_COLUMN = "__eventlake_source_file"
 
 
@@ -146,7 +147,17 @@ class Event(BaseModel):
         # arriving through other means (e.g. dynamic class construction)
         # and documents the reserved prefix as an explicit contract rather
         # than relying on that pydantic behavior as an implementation detail.
-        for name in cls.__dict__.get("__annotations__", {}):
+        own_annotations = cls.__dict__.get("__annotations__", {})
+        # event_id / occurred_at / recorded_at drive deduplication, partitioning
+        # and state_as_of ordering. A subclass that redefines one (say
+        # `event_id: str | None = None`) would make distinct events look like
+        # duplicates and silently drop them.
+        for name in _MANAGED_FIELDS & set(own_annotations):
+            raise TypeError(
+                f"{cls.__name__}.{name}: {sorted(_MANAGED_FIELDS)} are defined by Event "
+                f"and cannot be redefined in a subclass"
+            )
+        for name in own_annotations:
             if name.startswith(RESERVED_FIELD_PREFIX):
                 raise TypeError(
                     f"{cls.__name__}.{name}: field names starting with "

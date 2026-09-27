@@ -346,3 +346,18 @@ def test_event_to_record_converts_uuid_enum_and_list() -> None:
     assert record["tags"] == ["a", "b"]
     assert record["name"] == "apple"
     assert record["note"] is None
+
+
+@pytest.mark.parametrize("field", ["event_id", "occurred_at", "recorded_at"])
+def test_managed_fields_cannot_be_redefined(field: str) -> None:
+    with pytest.raises(TypeError, match="cannot be redefined"):
+        type(
+            "Redefines",
+            (Event,),
+            {
+                "__annotations__": {field: "str | None", "event_type": "ClassVar[str]"},
+                field: None,
+                "event_type": "redefines",
+                "__module__": __name__,
+            },
+        )

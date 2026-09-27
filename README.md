@@ -308,7 +308,10 @@ as of 2026-01-02T00:00:00+00:00, 19 corrections were known
 
 - Object storage backends (`s3://` and similar) - local filesystem only, for now.
 - Concurrent writers compacting the same partition at the same time.
-- PyPI publishing and a hosted GitHub repository - this is a local, standalone project.
+- Untrusted lake roots. The root is assumed to be a directory you control:
+  eventlake follows symlinks inside it, so a symlink planted there could
+  redirect writes (or `compact`'s deletes) outside the root.
+- PyPI publishing - install from a clone for now.
 
 ## Development
 
@@ -357,5 +360,6 @@ ML の学習データや分析に必要なのは、まさにその履歴です�
   （暗黙にローカル時刻として扱わない）
 
 `examples/label_history.py` は、ML の予測とラベル修正の履歴を題材にした自己完結のデモです
-(乱数で合成したデータのみを使用)。ローカルファイルシステム専用で、S3 等のクラウド対応、
-PyPI 公開、GitHub リポジトリの作成は本プロジェクトの対象外です。
+(乱数で合成したデータのみを使用)。ローカルファイルシステム専用で、S3 等のクラウド対応と
+PyPI 公開は対象外です。保存先は自分が管理するディレクトリであることを前提にしています
+（中のシンボリックリンクはたどるため、信頼できない場所を保存先にしないでください）。

@@ -72,7 +72,10 @@ class Writer:
             if event.event_id in self._seen_event_ids:
                 continue
             self._seen_event_ids.add(event.event_id)
-            recorded = event.model_copy(update={"recorded_at": datetime.now(UTC)})
+            # deep=True: Event is frozen, but a list field is still a mutable
+            # object shared with the caller. A shallow copy would let the
+            # caller change what gets written after write() has returned.
+            recorded = event.model_copy(update={"recorded_at": datetime.now(UTC)}, deep=True)
             cls = type(recorded)
             self._buffers[cls].append(recorded)
             if len(self._buffers[cls]) >= self._max_rows:

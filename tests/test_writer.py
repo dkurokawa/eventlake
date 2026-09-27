@@ -333,3 +333,18 @@ def test_partial_multiday_flush_failure_does_not_duplicate_on_retry(
     files_02_after = list((tmp_path / "ping" / "dt=2026-01-02").glob("part-*.parquet"))
     assert len(files_01_after) == 1  # unchanged - not duplicated
     assert len(files_02_after) == 1
+
+
+class Tagged(Event):
+    event_type: ClassVar[str] = "tagged"
+    tags: list[str]
+
+
+def test_mutating_a_list_after_write_does_not_change_what_is_stored(tmp_path: Path) -> None:
+    event = Tagged(occurred_at=utc(2026, 1, 1), tags=["a"])
+    with Writer(tmp_path) as writer:
+        writer.write(event)
+        event.tags.append("mutated-after-write")
+
+    (part,) = (tmp_path / "tagged").rglob("part-*.parquet")
+    assert pq.read_table(part).column("tags").to_pylist() == [["a"]]
