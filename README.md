@@ -131,14 +131,57 @@ with Writer(root, max_rows=10_000, allow_breaking=False) as writer:
   from the buffer immediately - a later retry only re-attempts what didn't
   make it, instead of writing duplicate files for partitions that already
   succeeded.
-- Writing the same `event_id` twice through the same `Writer` silently drops
-  the second copy. Duplicates that come from two different `Writer` runs
-  (e.g. a retried batch job) aren't caught here - see below.
+- Writing the same `event_id` twice while it is still buffered silently drops
+  the second copy. Once a batch is flushed the `Writer` forgets those ids (so
+  a long-lived writer's memory stays bounded); duplicates across flushes, or
+  from two different `Writer` runs, are removed when the lake is read - see
+  below.
+- A `Writer` is safe to share between threads, and `close()` flushes and then
+  refuses further writes.
 - **Multiple `Writer`s appending to the same root at the same time is fine**,
   including when they're registering different, concurrent schema changes
   for the same `event_type` (see "Schema evolution" below). Running
   `compact()` on a partition a `Writer` is actively targeting is not - see
   "Compaction" below.
+
+### Using it in an application
+
+Create one `Writer` when the process starts, share it, and close it on
+shutdown. Record an event at the point where something happens - next to the
+code that changes the database row, not by reading the row back later.
+
+```python
+# app startup
+writer = Writer("/var/lib/myapp/events", max_rows=500)
+
+# in a request handler, right where the state change happens
+def correct_label(item_id: str, old: str, new: str, reviewer: str) -> None:
+    db.update_label(item_id, new)          # the database keeps the current value
+    writer.write(LabelCorrected(           # the lake keeps what happened
+        item_id=item_id, old_label=old, new_label=new, reviewer=reviewer,
+        occurred_at=datetime.now(timezone.utc),
+    ))
+
+# a timer (every few seconds) and on shutdown
+writer.flush()
+writer.close()
+```
+
+Events sit in memory until they are flushed, so a crash loses what was
+buffered. Pick `max_rows` and the flush interval for how much you can afford
+to lose; for events you must never lose, call `flush()` after writing them.
+
+### Where this fits next to your database
+
+| Approach | What you get | What you don't |
+|---|---|---|
+| Snapshot export (e.g. RDS → S3 → Athena) | The current state of every row, periodically | Anything overwritten or deleted between snapshots; the order things happened in |
+| Change data capture (e.g. Debezium, DMS on the binlog/WAL) | Every row change, without touching application code | *Why* it changed and who did it - only the new column values |
+| **Application events (this library)** | What happened, in the application's own terms, with the context the code has at that moment | Changes made outside the application (manual SQL, other services) |
+
+They are complementary: snapshots answer "what is true now", events answer
+"how did it get this way". eventlake is for the second question when the
+application is the one that knows the answer.
 
 ### Storage layout
 
@@ -363,3 +406,8 @@ ML の学習データや分析に必要なのは、まさにその履歴です�
 (乱数で合成したデータのみを使用)。ローカルファイルシステム専用で、S3 等のクラウド対応と
 PyPI 公開は対象外です。保存先は自分が管理するディレクトリであることを前提にしています
 （中のシンボリックリンクはたどるため、信頼できない場所を保存先にしないでください）。
+
+アプリへの組み込みは、プロセスの起動時に `Writer` を1つ作って共有し（スレッドから同時に呼んでよい）、
+DB の行を書き換える箇所のすぐ隣でイベントを `write()` し、タイマーと終了時に `flush()` / `close()` します。
+DB の写し（RDS → S3 → Athena など）は「今の値」を、CDC は「行の変化」を残せますが、
+「なぜ・誰が変えたか」はアプリのイベントにしか残りません。eventlake はその層を担います。

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
@@ -48,6 +49,9 @@ class Writer:
         self._buffers: dict[type[Event], list[Event]] = defaultdict(list)
         self._seen_event_ids: set[uuid.UUID] = set()
         self._closed = False
+        # One Writer is meant to live for the whole process and be shared by
+        # request handlers, so buffer mutation and flushing are serialized.
+        self._lock = threading.RLock()
 
     def __enter__(self) -> Writer:
         return self
@@ -66,6 +70,10 @@ class Writer:
         self.write_many([event])
 
     def write_many(self, events: Sequence[Event]) -> None:
+        with self._lock:
+            self._write_many_locked(events)
+
+    def _write_many_locked(self, events: Sequence[Event]) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
         for event in events:
@@ -80,10 +88,27 @@ class Writer:
             self._buffers[cls].append(recorded)
             if len(self._buffers[cls]) >= self._max_rows:
                 self._flush_class(cls)
+                self._forget_flushed_ids()
 
     def flush(self) -> None:
-        for cls in list(self._buffers.keys()):
-            self._flush_class(cls)
+        with self._lock:
+            for cls in list(self._buffers.keys()):
+                self._flush_class(cls)
+            self._forget_flushed_ids()
+
+    def close(self) -> None:
+        """Flush what's buffered and refuse further writes."""
+        with self._lock:
+            if self._closed:
+                return
+            self.flush()
+            self._closed = True
+
+    def _forget_flushed_ids(self) -> None:
+        # In-writer dedup only needs to cover events that are still buffered.
+        # Keeping every id ever seen would grow without bound in a long-lived
+        # writer; duplicates across flushes are removed when the lake is read.
+        self._seen_event_ids = {e.event_id for buf in self._buffers.values() for e in buf}
 
     def _flush_class(self, cls: type[Event]) -> None:
         buffer = self._buffers.get(cls)

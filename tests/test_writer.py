@@ -8,6 +8,7 @@ import pytest
 from _helpers import utc
 
 from eventlake.event import Event
+from eventlake.lake import Lake
 from eventlake.schema import SchemaChangeError
 from eventlake.writer import Writer
 
@@ -69,14 +70,54 @@ def test_duplicate_event_id_within_same_writer_is_dropped(tmp_path: Path) -> Non
     assert table.num_rows == 1
 
 
-def test_duplicate_event_id_across_flushes_in_same_writer_is_dropped(tmp_path: Path) -> None:
+def test_duplicate_event_id_within_the_buffer_is_dropped(tmp_path: Path) -> None:
     event = Ping(occurred_at=utc(2026, 1, 1), source="a")
-    with Writer(tmp_path, max_rows=1) as writer:
-        writer.write(event)  # triggers immediate flush (max_rows=1)
-        writer.write(event)  # duplicate, must still be dropped after flush
+    with Writer(tmp_path) as writer:
+        writer.write(event)
+        writer.write(event)  # same id, still buffered: dropped here
 
     total_rows = sum(pq.read_table(f).num_rows for f in read_all_partition_files(tmp_path, "ping"))
     assert total_rows == 1
+
+
+def test_duplicate_across_flushes_is_removed_on_read(tmp_path: Path) -> None:
+    # The writer forgets ids once they are flushed (so a long-lived writer's
+    # memory stays bounded); the read path is what guarantees one row per id.
+    event = Ping(occurred_at=utc(2026, 1, 1), source="a")
+    with Writer(tmp_path, max_rows=1) as writer:
+        writer.write(event)  # flushed immediately
+        writer.write(event)  # written again as its own file
+
+    assert Lake(tmp_path).events("ping").to_arrow_table().num_rows == 1
+
+
+def test_seen_ids_do_not_grow_past_the_buffer(tmp_path: Path) -> None:
+    writer = Writer(tmp_path, max_rows=10)
+    for i in range(100):
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source=str(i)))
+    writer.flush()
+    assert len(writer._seen_event_ids) == 0
+
+
+def test_concurrent_writes_from_threads_lose_nothing(tmp_path: Path) -> None:
+    import threading
+
+    writer = Writer(tmp_path, max_rows=7)
+
+    def work(offset: int) -> None:
+        for i in range(50):
+            writer.write(Ping(occurred_at=utc(2026, 1, 1), source=f"{offset}-{i}"))
+
+    threads = [threading.Thread(target=work, args=(t,)) for t in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    writer.close()
+
+    assert Lake(tmp_path).events("ping").to_arrow_table().num_rows == 8 * 50
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="late"))
 
 
 def test_max_rows_triggers_automatic_flush(tmp_path: Path) -> None:
