@@ -6,9 +6,21 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
-    "pydantic>=2",
-    "pyarrow>=14",
-    "duckdb>=0.10",
+    # 2.5.0: the lowest version verified (full test suite, this project's
+    # actual usage of ConfigDict/model_validator/__pydantic_init_subclass__)
+    # to install as a prebuilt wheel and pass, on Python 3.11-3.13.
+    "pydantic>=2.5.0",
+    # 16.0.0: the lowest version verified against the numpy this environment
+    # resolves; 14.x hits a pyarrow/numpy ABI mismatch ("_ARRAY_API not
+    # found") with a current numpy, so pin above that boundary.
+    "pyarrow>=16.0.0",
+    # 1.5.0: verified empirically - 1.4.x and earlier drop the connection
+    # underneath a still-live relation in exactly the pattern this library
+    # uses (`Lake(root).events(...).to_arrow_table()`, with no variable
+    # holding the Lake itself): the connection gets garbage collected
+    # before the relation is done with it, raising "Connection has already
+    # been closed". Fixed in 1.5.0.
+    "duckdb>=1.5.0",
     "pytz>=2026.4",
 ]
 
@@ -19,7 +31,10 @@ eventlake = "eventlake.cli:main"
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
-    "hypothesis>=6",
+    # 6.70.0: hypothesis==6.0.0 (the plain ">=6" floor) crashes on import
+    # under Python 3.11/3.12 (`EntryPoints.get` was removed from stdlib
+    # importlib.metadata); verified 6.70.0 imports and the suite passes.
+    "hypothesis>=6.70.0",
     "ruff>=0.6",
     "mypy>=1.10",
 ]
