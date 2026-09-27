@@ -154,13 +154,20 @@ code that changes the database row, not by reading the row back later.
 # app startup
 writer = Writer("/var/lib/myapp/events", max_rows=500)
 
+
 # in a request handler, right where the state change happens
 def correct_label(item_id: str, old: str, new: str, reviewer: str) -> None:
-    db.update_label(item_id, new)          # the database keeps the current value
-    writer.write(LabelCorrected(           # the lake keeps what happened
-        item_id=item_id, old_label=old, new_label=new, reviewer=reviewer,
-        occurred_at=datetime.now(timezone.utc),
-    ))
+    db.update_label(item_id, new)  # the database keeps the current value
+    writer.write(
+        LabelCorrected(  # the lake keeps what happened
+            item_id=item_id,
+            old_label=old,
+            new_label=new,
+            reviewer=reviewer,
+            occurred_at=datetime.now(timezone.utc),
+        )
+    )
+
 
 # a timer (every few seconds) and on shutdown
 writer.flush()
