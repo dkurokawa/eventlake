@@ -149,9 +149,7 @@ def main() -> None:
 
         cutoff = BASE_TIME + timedelta(hours=24)
         as_of = lake.state_as_of("label_corrected", key="item_id", at=cutoff)
-        # as_of carries timestamp columns, so materialize via Arrow rather
-        # than fetchall() (DuckDB's row-fetch path needs pytz for those).
-        known_corrections_count = as_of.to_arrow_table().num_rows
+        known_corrections_count = len(as_of.fetchall())
         print(f"as of {cutoff.isoformat()}, {known_corrections_count} corrections were known")
         print("(a mutable 'current label' table cannot answer this at all - it only")
         print(" ever holds the latest value, with no record of when it changed)")

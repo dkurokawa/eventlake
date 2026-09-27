@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import ClassVar
 
@@ -34,6 +35,17 @@ def test_events_returns_all_rows(tmp_path: Path) -> None:
     table = lake.events("ping").to_arrow_table()
     assert table.num_rows == 2
     assert set(table.column("source").to_pylist()) == {"a", "b"}
+
+
+def test_fetchall_returns_timezone_aware_utc(tmp_path: Path) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    rows = Lake(tmp_path).sql("SELECT occurred_at FROM ping").fetchall()
+    assert len(rows) == 1
+    occurred_at = rows[0][0]
+    assert occurred_at.utcoffset() == timedelta(0)
+    assert occurred_at == utc(2026, 1, 1)
 
 
 def test_events_dedup_keeps_earliest_recorded_at(tmp_path: Path) -> None:

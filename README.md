@@ -158,10 +158,9 @@ lake.describe()  # per-type schema/partition/file/row counts
   then `event_id`, so the result is always deterministic). Leave `at` unset
   to get the latest state overall.
 
-Relations returned by `Lake` carry timezone-aware timestamp columns; convert
-them with `.to_arrow_table()`, `.df()`, etc. rather than `.fetchall()` if
-your DuckDB build needs `pytz` for that path (this project doesn't depend on
-`pytz`, to keep it small).
+Relations returned by `Lake` carry timezone-aware (UTC) timestamp columns.
+`.fetchall()`, `.to_arrow_table()` and `.df()` all work; `pytz` is a
+dependency because DuckDB needs it to hand timezone-aware values to Python.
 
 ### Compaction (`eventlake.compact`)
 
