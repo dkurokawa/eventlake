@@ -93,6 +93,13 @@ def test_compact_command_rejects_unsafe_event_type(tmp_path: Path) -> None:
         main(["compact", str(tmp_path), "../escape", "2026-01-01"])
 
 
+def test_compact_command_rejects_unsafe_dt(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid partition date"):
+        main(["compact", str(tmp_path), "ping", "../x"])
+    with pytest.raises(ValueError, match="invalid partition date"):
+        main(["compact", str(tmp_path), "ping", "2026-1-1"])
+
+
 def test_schema_command_rejects_unsafe_event_type(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="invalid event_type"):
         main(["schema", str(tmp_path), "/abs/path"])

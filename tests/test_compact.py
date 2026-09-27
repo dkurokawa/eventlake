@@ -239,3 +239,62 @@ def test_compact_incomplete_when_old_file_deletion_fails_and_rerun_cleans_up(
 def test_compact_validates_event_type_before_using_it_as_a_path() -> None:
     with pytest.raises(ValueError, match="invalid event_type"):
         compact("/tmp/does-not-matter", "../escape", "2026-01-01")
+
+
+@pytest.mark.parametrize(
+    "bad_dt",
+    ["../x", "2026-1-1", "/abs/path", "", "20260101", "2026-01-01T00:00:00"],
+)
+def test_compact_validates_dt_before_using_it_as_a_path(tmp_path: Path, bad_dt: str) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    with pytest.raises(ValueError, match="invalid partition date"):
+        compact(tmp_path, "ping", bad_dt)
+
+    # Nothing should have been created or removed outside the real partition.
+    assert (tmp_path / "ping" / "dt=2026-01-01").exists()
+    assert not (tmp_path.parent / "x").exists()
+
+
+# --- K3: a user "filename" field must not collide with the dedup tiebreak --
+
+
+class Download(Event):
+    event_type: ClassVar[str] = "download"
+
+    filename: str
+    size: int
+
+
+def test_events_and_compact_work_with_a_real_filename_field(tmp_path: Path) -> None:
+    with Writer(tmp_path) as writer:
+        writer.write(Download(occurred_at=utc(2026, 1, 1), filename="a.txt", size=1))
+    with Writer(tmp_path) as writer:
+        writer.write(Download(occurred_at=utc(2026, 1, 1), filename="b.txt", size=2))
+
+    table = Lake(tmp_path).events("download").to_arrow_table()
+    assert table.num_rows == 2
+    by_filename = dict(
+        zip(table.column("filename").to_pylist(), table.column("size").to_pylist(), strict=True)
+    )
+    assert by_filename == {"a.txt": 1, "b.txt": 2}
+
+    result = compact(tmp_path, "download", "2026-01-01")
+    assert result.files_before == 2
+    assert result.files_after == 1
+    assert result.rows_after == 2
+
+    files = partition_files(tmp_path, "download", "2026-01-01")
+    assert len(files) == 1
+    out_table = pq.read_table(files[0])
+    assert "filename" in out_table.column_names
+    assert "__eventlake_source_file" not in out_table.column_names
+    by_filename_after = dict(
+        zip(
+            out_table.column("filename").to_pylist(),
+            out_table.column("size").to_pylist(),
+            strict=True,
+        )
+    )
+    assert by_filename_after == {"a.txt": 1, "b.txt": 2}

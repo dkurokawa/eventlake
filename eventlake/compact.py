@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import duckdb
 import pyarrow.parquet as pq
 
-from .event import validate_event_type
+from .event import RESERVED_SOURCE_FILE_COLUMN, validate_event_type
+
+
+def validate_dt(dt: str) -> None:
+    """Raise ValueError unless `dt` is a strict `YYYY-MM-DD` date string.
+
+    `dt` is embedded directly into a filesystem path (`dt=<dt>`), so a loose
+    `date.fromisoformat()` isn't enough on its own (Python 3.11+ accepts a
+    wider range of ISO 8601 forms there than the `dt=YYYY-MM-DD` layout
+    uses) - the parsed date's canonical string form must round-trip back to
+    exactly `dt`, which also rules out anything path-like (`../x`, an
+    absolute path) since those never parse as a date at all.
+    """
+    try:
+        parsed = date.fromisoformat(dt)
+    except ValueError as exc:
+        raise ValueError(f"invalid partition date {dt!r}: must be YYYY-MM-DD") from exc
+    if str(parsed) != dt:
+        raise ValueError(f"invalid partition date {dt!r}: must be YYYY-MM-DD")
 
 
 @dataclass(frozen=True)
@@ -53,6 +72,10 @@ def _quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
 def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
     """Merge every file in `<root>/<event_type>/dt=<dt>/` into one file.
 
@@ -72,6 +95,7 @@ def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
     scope; run compaction when no writer is targeting that partition.
     """
     validate_event_type(event_type)
+    validate_dt(dt)
     root = Path(root)
     partition_dir = root / event_type / f"dt={dt}"
     files = sorted(partition_dir.glob("part-*.parquet"))
@@ -84,9 +108,12 @@ def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
     try:
         con.execute("SET TimeZone='UTC'")
         file_list = ", ".join(_quote_literal(str(f)) for f in files)
+        # filename=<reserved name>, not filename=true: see the comment on
+        # Lake._from_files_expr - plain `filename=true` collides with a
+        # real event field that happens to be named "filename".
         source_expr = (
-            f"read_parquet([{file_list}], union_by_name=true, "
-            "hive_partitioning=false, filename=true)"
+            f"read_parquet([{file_list}], union_by_name=true, hive_partitioning=false, "
+            f"filename={_quote_literal(RESERVED_SOURCE_FILE_COLUMN)})"
         )
 
         if len(files) == 1:
@@ -98,11 +125,12 @@ def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
                 # The only file has no duplicates: nothing to do.
                 return CompactResult(event_type, dt, 1, 1, rows_before, rows_before)
 
+        source_file = _quote_identifier(RESERVED_SOURCE_FILE_COLUMN)
         relation = con.sql(
             f"""
-            SELECT * EXCLUDE (__rn, filename) FROM (
+            SELECT * EXCLUDE (__rn, {source_file}) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY event_id ORDER BY recorded_at ASC, filename ASC
+                    PARTITION BY event_id ORDER BY recorded_at ASC, {source_file} ASC
                 ) AS __rn
                 FROM {source_expr}
             ) WHERE __rn = 1

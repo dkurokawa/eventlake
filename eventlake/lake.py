@@ -9,7 +9,7 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 
-from .event import EVENT_TYPE_PATTERN
+from .event import EVENT_TYPE_PATTERN, RESERVED_SOURCE_FILE_COLUMN
 from .schema import SchemaRegistry
 
 
@@ -107,32 +107,38 @@ class Lake:
         # hive_partitioning=false: the `dt=` directories are a physical
         # layout detail, not a data column. Without this, DuckDB auto-detects
         # the Hive layout and silently adds a `dt` column to every result.
-        # filename=true: adds a `filename` column, used as the final,
-        # always-distinguishing dedup tiebreak below (event_id is constant
-        # within the PARTITION BY event_id window, so it has no power there;
-        # see _dedup_query).
+        # filename=<reserved name>: adds a source-file column under a name
+        # reserved for eventlake's own use (Event rejects it as a field name
+        # at class-definition time - see RESERVED_FIELD_PREFIX), used as the
+        # final, always-distinguishing dedup tiebreak below (event_id is
+        # constant within the PARTITION BY event_id window, so it has no
+        # power there; see _dedup_query). Plain `filename=true` would
+        # collide with - and either error or shadow - a real event field
+        # that happens to be named "filename".
         file_list = ", ".join(_quote_literal(f) for f in files)
         return (
             f"read_parquet([{file_list}], union_by_name=true, "
-            "hive_partitioning=false, filename=true)"
+            f"hive_partitioning=false, filename={_quote_literal(RESERVED_SOURCE_FILE_COLUMN)})"
         )
 
     def _from_glob_expr(self, event_type: str) -> str:
         pattern = str(self._root / event_type / "dt=*" / "part-*.parquet")
         return (
             f"read_parquet({_quote_literal(pattern)}, union_by_name=true, "
-            "hive_partitioning=false, filename=true)"
+            f"hive_partitioning=false, filename={_quote_literal(RESERVED_SOURCE_FILE_COLUMN)})"
         )
 
     @staticmethod
     def _dedup_query(from_expr: str) -> str:
         # event_id is constant within this PARTITION BY, so it cannot break
         # a tie by itself; recorded_at first (the documented rule: earliest
-        # wins), then filename as a final, always-distinct tiebreak.
+        # wins), then the reserved source-file column as a final,
+        # always-distinct tiebreak.
+        source_file = _quote_identifier(RESERVED_SOURCE_FILE_COLUMN)
         return f"""
-            SELECT * EXCLUDE (__rn, filename) FROM (
+            SELECT * EXCLUDE (__rn, {source_file}) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY event_id ORDER BY recorded_at ASC, filename ASC
+                    PARTITION BY event_id ORDER BY recorded_at ASC, {source_file} ASC
                 ) AS __rn
                 FROM {from_expr}
             ) WHERE __rn = 1
