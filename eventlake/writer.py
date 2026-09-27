@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import uuid
 from collections import defaultdict
 from collections.abc import Sequence
@@ -119,6 +118,15 @@ class Writer:
             self._buffers[cls] = remaining
 
     def _write_file(self, event_type: str, dt: str, table: pa.Table) -> None:
+        # A failed write leaves the partition directory in place even if
+        # it's now empty (this Writer just created it): removing it would
+        # race with another Writer concurrently targeting the same
+        # partition - it could rmdir the directory in the moment between
+        # that other Writer's mkdir(exist_ok=True) no-op and its own write,
+        # pulling the directory out from under a write that was otherwise
+        # fine. An empty (or nonexistent) partition directory is already
+        # invisible to Lake (see Lake._event_types), so there's nothing to
+        # clean up here that matters.
         partition_dir = self._root / event_type / f"dt={dt}"
         partition_dir.mkdir(parents=True, exist_ok=True)
         filename = f"part-{uuid.uuid4()}.parquet"
@@ -129,7 +137,4 @@ class Writer:
             tmp_path.rename(final_path)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
-            with contextlib.suppress(OSError):
-                if not any(partition_dir.iterdir()):
-                    partition_dir.rmdir()
             raise
