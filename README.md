@@ -433,6 +433,9 @@ as of 2026-01-02T00:00:00+00:00, 19 corrections were known
 - Concurrent writers compacting the same partition at the same time, and
   `compact()` running while a `Writer` targets the same partition - on S3 as
   on a local root.
+- Wildcard characters in a local root's path: DuckDB expands `*`, `?`, `[` and
+  `]` in the file names it reads, so a local root whose path contains them can
+  read the wrong files. (An `s3://` prefix with such characters is refused.)
 - Untrusted lake roots. The root is assumed to be a directory you control:
   eventlake follows symlinks inside it, so a symlink planted there could
   redirect writes (or `compact`'s deletes) outside the root.

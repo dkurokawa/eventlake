@@ -55,6 +55,21 @@ def test_parse_s3_uri_accepts(uri: str, expected: tuple[str, str]) -> None:
         "s3://bucket/./b",
         "s3://bucket/a//b",
         "s3://bucket/a//",
+        "s3://bucket/a*",
+        "s3://bucket/a?b",
+        "s3://bucket/a[0-9]",
+        "s3://bucket/a]",
+        "s3://bucket/{a,b}",
+        "s3://bucket/x/}",
+        "s3://my..bucket/p",  # consecutive periods
+        "s3://192.168.5.4/p",  # IP-address-shaped
+        "s3://xn--bucket/p",
+        "s3://sthree-bucket/p",
+        "s3://amzn-s3-demo-bucket/p",
+        "s3://bucket-s3alias/p",
+        "s3://bucket--ol-s3/p",
+        "s3://bucket--x-s3/p",
+        "s3://bucket.mrap/p",
         "https://bucket/p",
         "bucket/p",
     ],
@@ -62,6 +77,28 @@ def test_parse_s3_uri_accepts(uri: str, expected: tuple[str, str]) -> None:
 def test_parse_s3_uri_rejects(uri: str) -> None:
     with pytest.raises(ValueError):
         parse_s3_uri(uri)
+
+
+@pytest.mark.parametrize(
+    ("bucket", "prefix"),
+    [
+        ("my-bucket", "a*"),
+        ("my-bucket", "a?"),
+        ("my-bucket", "[ab]"),
+        ("my-bucket", "{a,b}"),
+        ("my-bucket", "a/../b"),
+        ("my-bucket", "a//b"),
+        ("my..bucket", ""),
+        ("10.0.0.1", ""),
+        ("xn--bucket", ""),
+        ("bucket--x-s3", ""),
+        ("Upper", ""),
+    ],
+)
+def test_direct_construction_is_validated_too(bucket: str, prefix: str) -> None:
+    # The client is never used: validation happens first.
+    with pytest.raises(ValueError):
+        S3Storage(bucket, prefix, client=object())  # type: ignore[arg-type]
 
 
 def test_open_storage_picks_the_backend_from_the_root(s3_client: S3Client, tmp_path: Path) -> None:

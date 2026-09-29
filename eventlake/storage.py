@@ -179,6 +179,41 @@ def resolve_storage(root: str | Path | None, storage: Storage | None) -> Storage
 _MAX_SINGLE_PUT_BYTES = 5 * 1024**3
 
 _BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+_IPV4_LIKE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
+# Names S3 reserves for its own resource types (access points, Object Lambda,
+# S3 on Outposts, directory buckets, multi-region access points).
+_RESERVED_BUCKET_PREFIXES = ("xn--", "sthree-", "amzn-s3-demo-")
+_RESERVED_BUCKET_SUFFIXES = ("-s3alias", "--ol-s3", "--x-s3", ".mrap")
+# DuckDB expands these in any file name it is given (read_parquet('...')), so a
+# prefix containing one could make it read a different prefix than the one
+# that was asked for.
+_GLOB_CHARACTERS = frozenset("*?[]{}")
+
+
+def _validate_bucket(bucket: str) -> None:
+    if (
+        _BUCKET_PATTERN.fullmatch(bucket) is None
+        or ".." in bucket
+        or _IPV4_LIKE.fullmatch(bucket) is not None
+        or bucket.startswith(_RESERVED_BUCKET_PREFIXES)
+        or bucket.endswith(_RESERVED_BUCKET_SUFFIXES)
+    ):
+        raise ValueError(f"invalid S3 bucket name: {bucket!r}")
+
+
+def _validate_prefix(prefix: str) -> None:
+    """`prefix` has no trailing `/`; empty means the bucket root."""
+    if not prefix:
+        return
+    if any(segment in ("", ".", "..") for segment in prefix.split("/")):
+        raise ValueError(
+            f"invalid S3 prefix {prefix!r}: '.', '..' and empty segments are not allowed"
+        )
+    if _GLOB_CHARACTERS & set(prefix):
+        raise ValueError(
+            f"invalid S3 prefix {prefix!r}: the characters * ? [ ] {{ }} are not allowed "
+            "(DuckDB would expand them as wildcards)"
+        )
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -187,18 +222,15 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     The prefix loses one trailing `/`; an empty prefix (the bucket root) is
     allowed. `.`, `..` and empty segments (`a//b`) are rejected: they mean
     different things to different tools and none of them belong in a root.
+    So are glob characters in the prefix (see `_GLOB_CHARACTERS`).
     """
     if not uri.startswith("s3://"):
         raise ValueError(f"not an s3:// URI: {uri!r}")
     bucket, _, prefix = uri[len("s3://") :].partition("/")
-    if _BUCKET_PATTERN.fullmatch(bucket) is None:
-        raise ValueError(f"invalid S3 bucket name in {uri!r}")
     if prefix.endswith("/"):
         prefix = prefix[:-1]
-    if prefix and any(segment in ("", ".", "..") for segment in prefix.split("/")):
-        raise ValueError(
-            f"invalid S3 prefix in {uri!r}: '.', '..' and empty segments are not allowed"
-        )
+    _validate_bucket(bucket)
+    _validate_prefix(prefix)
     return bucket, prefix
 
 
@@ -210,6 +242,10 @@ class S3Storage:
     """
 
     def __init__(self, bucket: str, prefix: str = "", *, client: S3Client | None = None) -> None:
+        # Validated here too, not only in parse_s3_uri: constructing the class
+        # directly must not be a way around the checks.
+        _validate_bucket(bucket)
+        _validate_prefix(prefix)
         self._bucket = bucket
         self._prefix = prefix
         if client is None:
