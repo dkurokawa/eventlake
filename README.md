@@ -242,8 +242,13 @@ same results. The rest of this section is what differs.
 - **Reads go through DuckDB's `httpfs` extension.** DuckDB downloads that
   extension the first time it is installed, so the first `Lake(...)` on a
   machine needs network access to DuckDB's extension server. The credentials
-  are handed to DuckDB as a session secret; they are not written to disk and
-  are kept out of exception messages.
+  are handed to DuckDB as a session secret scoped to the root's `s3://` path;
+  they are not written to disk and are kept out of exception messages.
+  On the standard AWS endpoints the region DuckDB uses is the bucket's own
+  (looked up with `HeadBucket`), not the client's. Any other endpoint - a VPC
+  endpoint, MinIO, moto - is used exactly as the client has it, with the bucket
+  in the path; an endpoint URL with a path in it (`https://host/prefix`) is
+  refused, because DuckDB would drop the path and read somewhere else.
 - **A `Lake` uses the credentials it was created with.** They are read once,
   when the `Lake` is constructed. With temporary credentials (an assumed role)
   that expire, create a new `Lake` instead of holding one for hours. (A

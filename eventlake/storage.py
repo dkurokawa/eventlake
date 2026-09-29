@@ -184,6 +184,13 @@ _IPV4_LIKE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
 # S3 on Outposts, directory buckets, multi-region access points).
 _RESERVED_BUCKET_PREFIXES = ("xn--", "sthree-", "amzn-s3-demo-")
 _RESERVED_BUCKET_SUFFIXES = ("-s3alias", "--ol-s3", "--x-s3", ".mrap")
+# The public AWS S3 endpoints: s3.amazonaws.com, s3.<region>.amazonaws.com,
+# s3-<region>.amazonaws.com, s3.dualstack.<region>.amazonaws.com, and the same
+# under amazonaws.com.cn. Anything else (VPC endpoints, moto, MinIO) is
+# addressed explicitly.
+_STANDARD_AWS_HOST = re.compile(
+    r"s3(\.dualstack\.[a-z0-9-]+|[.-][a-z0-9-]+)?\.amazonaws\.com(\.cn)?"
+)
 # DuckDB expands these in any file name it is given (read_parquet('...')), so a
 # prefix containing one could make it read a different prefix than the one
 # that was asked for.
@@ -335,6 +342,25 @@ class S3Storage:
         except (ClientError, BotoCoreError) as exc:
             raise OSError(f"could not delete {self.uri(key)}: {exc}") from exc
 
+    def _bucket_region(self) -> str | None:
+        """The region the bucket lives in, from S3's `x-amz-bucket-region` header.
+
+        HeadBucket answers with that header even when it fails (a 301/403 for
+        a bucket in another region), so it is read from the error response too.
+        None when it cannot be found; the caller falls back to the client's.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            response = self._client.head_bucket(Bucket=self._bucket)
+        except ClientError as exc:
+            response = cast(Any, exc.response)
+        except BotoCoreError:
+            return None
+        headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        region = headers.get("x-amz-bucket-region")
+        return region if isinstance(region, str) and region else None
+
     def configure_duckdb(self, con: duckdb.DuckDBPyConnection) -> None:
         """Load httpfs and hand DuckDB this client's credentials and endpoint.
 
@@ -342,35 +368,48 @@ class S3Storage:
         temporary credentials). They travel inside a SQL string, so a failure
         here is re-raised without the statement or the driver's message.
         """
+        endpoint = urlparse(self._client.meta.endpoint_url)
+        if endpoint.path not in ("", "/"):
+            # DuckDB takes host[:port] only; a path prefix on the endpoint
+            # would be dropped and a different location read without a word.
+            raise ValueError("the S3 endpoint URL has a path, which DuckDB cannot use")
         # botocore has no public accessor for a client's credentials; the
         # request signer holds them (and refreshes them, for assumed roles).
         credentials = cast(Any, self._client)._request_signer._credentials
         if credentials is None:
             raise RuntimeError("the boto3 client has no credentials; DuckDB cannot read S3")
         frozen = credentials.get_frozen_credentials()
+        scope = f"s3://{self._bucket}/{self._prefix}" if self._prefix else f"s3://{self._bucket}"
         options = [
             "TYPE s3",
             "PROVIDER config",
             f"KEY_ID {_quote_literal(frozen.access_key)}",
             f"SECRET {_quote_literal(frozen.secret_key)}",
+            # Only paths under this root use these credentials.
+            f"SCOPE {_quote_literal(scope)}",
         ]
         if frozen.token:
             options.append(f"SESSION_TOKEN {_quote_literal(frozen.token)}")
-        region = self._client.meta.region_name
-        if region:
-            options.append(f"REGION {_quote_literal(region)}")
-        endpoint = urlparse(self._client.meta.endpoint_url)
-        on_aws = (endpoint.hostname or "").endswith(("amazonaws.com", "amazonaws.com.cn"))
-        if not on_aws:
-            # moto, MinIO and other S3-compatible servers: address the
-            # endpoint explicitly, buckets in the path.
+        if _STANDARD_AWS_HOST.fullmatch(endpoint.hostname or "") is not None:
+            # The public AWS endpoint: DuckDB derives the host from the region,
+            # which has to be the *bucket's* region, not the client's.
+            region = self._bucket_region() or self._client.meta.region_name
+            if region:
+                options.append(f"REGION {_quote_literal(region)}")
+            if "." in self._bucket:
+                # A dotted bucket name does not match the wildcard TLS
+                # certificate of virtual-hosted-style addressing.
+                options.append("URL_STYLE 'path'")
+        else:
+            # Anything else - a VPC endpoint, moto, MinIO, another
+            # S3-compatible server: use exactly the endpoint the client uses,
+            # buckets in the path.
+            region = self._client.meta.region_name
+            if region:
+                options.append(f"REGION {_quote_literal(region)}")
             options.append(f"ENDPOINT {_quote_literal(endpoint.netloc)}")
             options.append("URL_STYLE 'path'")
             options.append(f"USE_SSL {'true' if endpoint.scheme == 'https' else 'false'}")
-        elif "." in self._bucket:
-            # A dotted bucket name does not match the wildcard TLS
-            # certificate of virtual-hosted-style addressing.
-            options.append("URL_STYLE 'path'")
 
         # No secret values in these two statements.
         con.execute("INSTALL httpfs")
