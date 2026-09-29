@@ -96,3 +96,14 @@ def s3_bucket(s3_client: S3Client) -> Iterator[str]:
             for item in page.get("Contents", []):
                 s3_client.delete_object(Bucket=bucket, Key=item["Key"])
         s3_client.delete_bucket(Bucket=bucket)
+
+
+@pytest.fixture(params=["local", "s3"])
+def lake_root(request: pytest.FixtureRequest, tmp_path: Path) -> str | Path:
+    """A fresh, empty eventlake root on each backend: a directory, or an
+    `s3://` URI in a fresh moto bucket (boto3 finds moto through the standard
+    endpoint variable). Tests taking this run once per backend."""
+    if request.param == "local":
+        return tmp_path
+    bucket: str = request.getfixturevalue("s3_bucket")
+    return f"s3://{bucket}/lake"

@@ -49,7 +49,9 @@ class CompactionIncomplete(Exception):
 
     The new file (a complete, correctly-deduplicated merge of everything
     that was in the partition) is safely in place; the old files listed in
-    `leftover_files` are still there too. Reading through `Lake` still
+    `leftover_files` are still there too. Both are keys relative to the root
+    (e.g. `ping/dt=2026-01-01/part-<uuid>.parquet`), the same on every
+    backend. Reading through `Lake` still
     produces correct, deduplicated results in this state - the surviving
     old files just contain rows that are now duplicates of what's in the
     new file, and `Lake.events()` already dedups by event_id. Re-running
@@ -57,9 +59,7 @@ class CompactionIncomplete(Exception):
     finishes the cleanup.
     """
 
-    def __init__(
-        self, event_type: str, dt: str, new_file: Path, leftover_files: list[Path]
-    ) -> None:
+    def __init__(self, event_type: str, dt: str, new_file: str, leftover_files: list[str]) -> None:
         self.event_type = event_type
         self.dt = dt
         self.new_file = new_file
@@ -156,14 +156,14 @@ def compact(
     new_key = f"{partition}/part-{uuid.uuid4()}.parquet"
     store.put_atomic(new_key, table_to_parquet_bytes(table))
 
-    leftover: list[Path] = []
+    leftover: list[str] = []
     for old_key in keys:
         try:
             store.delete(old_key)
         except OSError:
-            leftover.append(Path(store.uri(old_key)))
+            leftover.append(old_key)
 
     if leftover:
-        raise CompactionIncomplete(event_type, dt, Path(store.uri(new_key)), leftover)
+        raise CompactionIncomplete(event_type, dt, new_key, leftover)
 
     return CompactResult(event_type, dt, len(files), 1, rows_before, rows_after)

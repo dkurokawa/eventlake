@@ -69,27 +69,51 @@ def _samples(draw: st.DrawFn) -> Sample:
     )
 
 
+def _assert_round_trip(root: str | Path, sample: Sample) -> None:
+    with Writer(root) as writer:
+        writer.write(sample)
+
+    lake = Lake(root)
+    table = lake.events("sample").to_arrow_table()
+    assert table.num_rows == 1
+    row = table.to_pylist()[0]
+
+    assert row["event_id"] == str(sample.event_id)
+    assert row["occurred_at"] == sample.occurred_at
+    assert row["name"] == sample.name
+    assert row["count"] == sample.count
+    assert row["ratio"] == sample.ratio
+    assert row["active"] == sample.active
+    assert row["on_date"] == sample.on_date
+    assert row["batch_id"] == str(sample.batch_id)
+    assert row["flavor"] == sample.flavor.value
+    assert row["tags"] == sample.tags
+    assert row["note"] == sample.note
+
+
+# Local only: 25 examples against an S3 server would make the suite slow for
+# no extra coverage - the value handling is the same on both backends. One
+# fixed case below runs the same assertions against S3.
 @given(_samples())
 @settings(max_examples=25, deadline=None)
 def test_property_round_trip_preserves_values(sample: Sample) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
-        root = Path(tmp_dir)
-        with Writer(root) as writer:
-            writer.write(sample)
+        _assert_round_trip(Path(tmp_dir), sample)
 
-        lake = Lake(root)
-        table = lake.events("sample").to_arrow_table()
-        assert table.num_rows == 1
-        row = table.to_pylist()[0]
 
-        assert row["event_id"] == str(sample.event_id)
-        assert row["occurred_at"] == sample.occurred_at
-        assert row["name"] == sample.name
-        assert row["count"] == sample.count
-        assert row["ratio"] == sample.ratio
-        assert row["active"] == sample.active
-        assert row["on_date"] == sample.on_date
-        assert row["batch_id"] == str(sample.batch_id)
-        assert row["flavor"] == sample.flavor.value
-        assert row["tags"] == sample.tags
-        assert row["note"] == sample.note
+def test_round_trip_preserves_every_field_type(lake_root: str | Path) -> None:
+    _assert_round_trip(
+        lake_root,
+        Sample(
+            occurred_at=datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC),
+            name="naïve ✓",
+            count=-7,
+            ratio=0.1,
+            active=True,
+            on_date=date(2026, 3, 4),
+            batch_id=uuid.uuid4(),
+            flavor=Flavor.SOUR,
+            tags=["x", "y"],
+            note=None,
+        ),
+    )
