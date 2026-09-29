@@ -24,6 +24,15 @@ dependencies = [
     "pytz>=2026.4",
 ]
 
+[project.optional-dependencies]
+s3 = [
+    # 1.35.2: the lowest version whose PutObject model has `IfNoneMatch`
+    # (S3 conditional writes), which is how a schema version is claimed
+    # exclusively. 1.35.1 and earlier reject the parameter client-side
+    # (checked with botocore pinned to the same version).
+    "boto3>=1.35.2",
+]
+
 [project.scripts]
 eventlake = "eventlake.cli:main"
 
@@ -37,6 +46,13 @@ dev = [
     "hypothesis>=6.70.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    # The S3 backend's tests run against moto's in-process S3 server.
+    "boto3>=1.35.2",
+    # 5.0.15: the lowest moto whose S3 server honours PutObject
+    # `IfNoneMatch` (412 on an existing key); 5.0.14 and earlier let the
+    # second write through, which would hide the exclusive-create logic.
+    "moto[server]>=5.0.15",
+    "boto3-stubs[s3]>=1.35.2",
 ]
 
 [build-system]
@@ -59,7 +75,7 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["duckdb.*", "pyarrow.*"]
+module = ["duckdb.*", "pyarrow.*", "moto.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
