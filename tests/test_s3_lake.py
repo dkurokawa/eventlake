@@ -170,7 +170,7 @@ def test_configure_duckdb_for_aws_uses_region_and_session_token() -> None:
     assert "REGION 'us-east-1'" in secret  # the bucket's (default of _fake_client)
     assert "ENDPOINT" not in secret  # DuckDB derives the AWS endpoint from the region
     assert "URL_STYLE" not in secret
-    assert "SCOPE 's3://my-bucket/lake'" in secret
+    assert "SCOPE 's3://my-bucket/lake/'" in secret
 
 
 def _aws_secret(**client_options: Any) -> str:
@@ -269,13 +269,23 @@ def test_the_secret_is_scoped_to_the_bucket_when_there_is_no_prefix() -> None:
     store = S3Storage("my-bucket", "", client=_fake_client(endpoint="http://x:1"))
     con = _RecordingConnection()
     store.configure_duckdb(con)  # type: ignore[arg-type]
-    assert "SCOPE 's3://my-bucket'" in _secret_statement(con)
+    assert "SCOPE 's3://my-bucket/'" in _secret_statement(con)
 
 
 def test_duckdb_records_the_scope_of_the_secret(s3_client: S3Client, s3_bucket: str) -> None:
     lake = Lake(storage=S3Storage(s3_bucket, "lake", client=s3_client))
     rows = lake.sql("SELECT scope FROM duckdb_secrets()").fetchall()
-    assert rows == [([f"s3://{s3_bucket}/lake"],)]
+    assert rows == [([f"s3://{s3_bucket}/lake/"],)]
+
+
+def test_the_secret_does_not_cover_a_sibling_prefix(s3_client: S3Client, s3_bucket: str) -> None:
+    lake = Lake(storage=S3Storage(s3_bucket, "lake", client=s3_client))
+    inside = lake.sql(f"SELECT name FROM which_secret('s3://{s3_bucket}/lake/x', 's3')").fetchall()
+    sibling = lake.sql(
+        f"SELECT name FROM which_secret('s3://{s3_bucket}/lakehouse/x', 's3')"
+    ).fetchall()
+    assert len(inside) == 1
+    assert sibling == []
 
 
 def test_configure_duckdb_for_a_custom_endpoint_uses_path_style() -> None:

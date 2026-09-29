@@ -190,7 +190,7 @@ _IPV4_LIKE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
 # Names S3 reserves for its own resource types (access points, Object Lambda,
 # S3 on Outposts, directory buckets, multi-region access points).
 _RESERVED_BUCKET_PREFIXES = ("xn--", "sthree-", "amzn-s3-demo-")
-_RESERVED_BUCKET_SUFFIXES = ("-s3alias", "--ol-s3", "--x-s3", ".mrap")
+_RESERVED_BUCKET_SUFFIXES = ("-s3alias", "--ol-s3", "--x-s3", "--table-s3", ".mrap")
 # The public AWS S3 endpoints: s3.amazonaws.com, s3.<region>.amazonaws.com,
 # s3-<region>.amazonaws.com, s3.dualstack.<region>.amazonaws.com, and the same
 # under amazonaws.com.cn. Anything else (VPC endpoints, moto, MinIO) is
@@ -393,7 +393,10 @@ class S3Storage:
         if credentials is None:
             raise RuntimeError("the boto3 client has no credentials; DuckDB cannot read S3")
         frozen = credentials.get_frozen_credentials()
-        scope = f"s3://{self._bucket}/{self._prefix}" if self._prefix else f"s3://{self._bucket}"
+        # DuckDB matches a scope as a plain string prefix, so it ends in `/`:
+        # otherwise `s3://b/lake` would also cover `s3://b/lakehouse/...`, and
+        # `s3://b` would cover `s3://b2/...`.
+        scope = f"s3://{self._bucket}/{self._prefix}/" if self._prefix else f"s3://{self._bucket}/"
         options = [
             "TYPE s3",
             "PROVIDER config",

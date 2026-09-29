@@ -441,6 +441,11 @@ as of 2026-01-02T00:00:00+00:00, 19 corrections were known
 - Wildcard characters in a local root's path: DuckDB expands `*`, `?`, `[` and
   `]` in the file names it reads, so a local root whose path contains them can
   read the wrong files. (An `s3://` prefix with such characters is refused.)
+- Partition directories that have the shape of a date but are not one
+  (`dt=2026-02-31/`). `Writer` never creates them, and `events()`,
+  `state_as_of()` and `describe()` skip them, but the same-named SQL views
+  match partitions by a `dt=YYYY-MM-DD` pattern and would read such a
+  directory if something else put Parquet files there.
 - Untrusted lake roots. The root is assumed to be a directory you control:
   eventlake follows symlinks inside it, so a symlink planted there could
   redirect writes (or `compact`'s deletes) outside the root.

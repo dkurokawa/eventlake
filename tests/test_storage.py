@@ -69,6 +69,7 @@ def test_parse_s3_uri_accepts(uri: str, expected: tuple[str, str]) -> None:
         "s3://bucket-s3alias/p",
         "s3://bucket--ol-s3/p",
         "s3://bucket--x-s3/p",
+        "s3://bucket--table-s3/p",
         "s3://bucket.mrap/p",
         "https://bucket/p",
         "bucket/p",
