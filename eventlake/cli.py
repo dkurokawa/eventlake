@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 from .compact import compact
 from .event import validate_event_type
@@ -42,7 +41,7 @@ def _cmd_schema(args: argparse.Namespace) -> int:
     # doesn't go through compact(), so it validates here before using the
     # value to build a filesystem path.
     validate_event_type(args.event_type)
-    registry = SchemaRegistry(Path(args.root))
+    registry = SchemaRegistry(args.root)
     versions = registry.all(args.event_type)
     if not versions:
         print(f"(no schema recorded for {args.event_type!r})")

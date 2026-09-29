@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import duckdb
-import pyarrow.parquet as pq
 
 from .event import RESERVED_SOURCE_FILE_COLUMN, validate_event_type
+from .storage import Storage, resolve_storage, table_to_parquet_bytes
+
+_PART_FILE = re.compile(r"part-[^/]+\.parquet")
 
 
 def validate_dt(dt: str) -> None:
@@ -76,7 +79,9 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
+def compact(
+    root: str | Path | None, event_type: str, dt: str, *, storage: Storage | None = None
+) -> CompactResult:
     """Merge every file in `<root>/<event_type>/dt=<dt>/` into one file.
 
     Duplicate event_ids (from separate Writer instances writing overlapping
@@ -96,18 +101,25 @@ def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
     """
     validate_event_type(event_type)
     validate_dt(dt)
-    root = Path(root)
-    partition_dir = root / event_type / f"dt={dt}"
-    files = sorted(partition_dir.glob("part-*.parquet"))
-    if not files:
+    store = resolve_storage(root, storage)
+    partition = f"{event_type}/dt={dt}"
+    keys = [
+        k for k in store.list_keys(f"{partition}/") if _PART_FILE.fullmatch(k[len(partition) + 1 :])
+    ]
+    if not keys:
         raise FileNotFoundError(f"no parquet files found for {event_type} dt={dt} under {root}")
-
-    rows_before = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+    files = [store.uri(k) for k in keys]
 
     con = duckdb.connect(database=":memory:")
     try:
         con.execute("SET TimeZone='UTC'")
-        file_list = ", ".join(_quote_literal(str(f)) for f in files)
+        store.configure_duckdb(con)
+        file_list = ", ".join(_quote_literal(f) for f in files)
+        rows_row = con.execute(
+            f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_file_metadata([{file_list}])"
+        ).fetchone()
+        assert rows_row is not None
+        rows_before = int(rows_row[0])
         # filename=<reserved name>, not filename=true: see the comment on
         # Lake._from_files_expr - plain `filename=true` collides with a
         # real event field that happens to be named "filename".
@@ -141,24 +153,17 @@ def compact(root: str | Path, event_type: str, dt: str) -> CompactResult:
         con.close()
 
     rows_after = table.num_rows
-    new_filename = f"part-{uuid.uuid4()}.parquet"
-    new_path = partition_dir / new_filename
-    tmp_path = partition_dir / f".{new_filename}.tmp"
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.rename(new_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    new_key = f"{partition}/part-{uuid.uuid4()}.parquet"
+    store.put_atomic(new_key, table_to_parquet_bytes(table))
 
     leftover: list[Path] = []
-    for old_file in files:
+    for old_key in keys:
         try:
-            old_file.unlink()
+            store.delete(old_key)
         except OSError:
-            leftover.append(old_file)
+            leftover.append(Path(store.uri(old_key)))
 
     if leftover:
-        raise CompactionIncomplete(event_type, dt, new_path, leftover)
+        raise CompactionIncomplete(event_type, dt, Path(store.uri(new_key)), leftover)
 
     return CompactResult(event_type, dt, len(files), 1, rows_before, rows_after)

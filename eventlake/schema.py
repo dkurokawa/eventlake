@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import uuid
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,12 +18,15 @@ from pathlib import Path
 import pyarrow as pa
 
 from .event import validate_event_type
+from .storage import Storage, resolve_storage
 
 logger = logging.getLogger(__name__)
 
 # How many times register() will re-read the latest version and retry after
 # losing a race to claim the next version number, before giving up.
 _MAX_REGISTER_ATTEMPTS = 10
+
+_VERSION_FILE = re.compile(r"v([0-9]+)\.json")
 
 _TYPE_TOKENS: dict[str, pa.DataType] = {
     "string": pa.string(),
@@ -177,32 +179,28 @@ class SchemaVersion:
 class SchemaRegistry:
     """Reads and writes `<root>/_schemas/<event_type>/v<N>.json` version files."""
 
-    def __init__(self, root: Path) -> None:
-        self._root = root
+    def __init__(self, root: str | Path | None = None, *, storage: Storage | None = None) -> None:
+        self._storage = resolve_storage(root, storage)
 
-    def _dir(self, event_type: str) -> Path:
+    def _dir(self, event_type: str) -> str:
         # Every other method funnels through here to turn event_type into a
         # path, so validating it in this one place protects all of them -
         # including a direct SchemaRegistry call that bypasses Event's own
         # class-definition-time check on event_type.
         validate_event_type(event_type)
-        return self._root / "_schemas" / event_type
+        return f"_schemas/{event_type}"
 
     def versions(self, event_type: str) -> list[int]:
         directory = self._dir(event_type)
-        if not directory.exists():
-            return []
         found: list[int] = []
-        for path in directory.glob("v*.json"):
-            try:
-                found.append(int(path.stem[1:]))
-            except ValueError:
-                continue
+        for key in self._storage.list_keys(f"{directory}/"):
+            match = _VERSION_FILE.fullmatch(key[len(directory) + 1 :])
+            if match is not None:
+                found.append(int(match.group(1)))
         return sorted(found)
 
     def load(self, event_type: str, version: int) -> SchemaVersion:
-        path = self._dir(event_type) / f"v{version}.json"
-        payload = json.loads(path.read_text())
+        payload = json.loads(self._storage.read_bytes(f"{self._dir(event_type)}/v{version}.json"))
         fields = [
             pa.field(f["name"], _token_to_type(f["type"]), nullable=f["nullable"])
             for f in payload["fields"]
@@ -284,14 +282,12 @@ class SchemaRegistry:
     def _write(self, event_type: str, version: int, schema: pa.Schema) -> SchemaVersion:
         """Exclusively create `v<version>.json`, or raise FileExistsError.
 
-        Writes the full content to a uniquely-named temp file first, then
-        atomically claims the target name with `os.link` (which fails with
-        FileExistsError if the target already exists, and never overwrites
-        it) - so a reader only ever sees the target absent or complete, and
-        two concurrent callers can't silently clobber each other's version.
+        The storage claims the target name without ever overwriting it (see
+        `Storage.put_exclusive`), so a reader only ever sees the version
+        absent or complete, and two concurrent callers can't silently clobber
+        each other's version.
         """
         directory = self._dir(event_type)
-        directory.mkdir(parents=True, exist_ok=True)
         created_at = datetime.now(UTC)
         payload = {
             "version": version,
@@ -301,11 +297,7 @@ class SchemaRegistry:
                 for f in schema
             ],
         }
-        path = directory / f"v{version}.json"
-        tmp_path = directory / f".v{version}.{uuid.uuid4().hex}.tmp"
-        tmp_path.write_text(json.dumps(payload, indent=2))
-        try:
-            os.link(tmp_path, path)
-        finally:
-            tmp_path.unlink(missing_ok=True)
+        self._storage.put_exclusive(
+            f"{directory}/v{version}.json", json.dumps(payload, indent=2).encode()
+        )
         return SchemaVersion(version=version, schema=schema, created_at=created_at)
