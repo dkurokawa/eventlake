@@ -128,7 +128,13 @@ class Lake:
         )
 
     def _from_glob_expr(self, event_type: str) -> str:
-        pattern = self._storage.uri(f"{event_type}/dt=*/part-*.parquet")
+        # dt is spelled out as a date shape, so a stray `dt=not-a-date/` next to
+        # the real partitions is not read (the same rule as _PART_KEY). Still a
+        # glob rather than a listing: files written after the Lake was created
+        # must show up in the view.
+        digit = "[0-9]"
+        dt = f"{digit * 4}-{digit * 2}-{digit * 2}"
+        pattern = self._storage.uri(f"{event_type}/dt={dt}/part-*.parquet")
         return (
             f"read_parquet({_quote_literal(pattern)}, union_by_name=true, "
             f"hive_partitioning=false, filename={_quote_literal(RESERVED_SOURCE_FILE_COLUMN)})"

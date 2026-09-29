@@ -107,7 +107,9 @@ def compact(
         k for k in store.list_keys(f"{partition}/") if _PART_FILE.fullmatch(k[len(partition) + 1 :])
     ]
     if not keys:
-        raise FileNotFoundError(f"no parquet files found for {event_type} dt={dt} under {root}")
+        raise FileNotFoundError(
+            f"no parquet files found for {event_type} dt={dt} under {store.uri(partition)}"
+        )
     files = [store.uri(k) for k in keys]
 
     con = duckdb.connect(database=":memory:")

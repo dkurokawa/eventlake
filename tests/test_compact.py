@@ -299,3 +299,23 @@ def test_events_and_compact_work_with_a_real_filename_field(lake_root: str | Pat
         )
     )
     assert by_filename_after == {"a.txt": 1, "b.txt": 2}
+
+
+def test_compact_missing_partition_message_names_the_location_with_storage(
+    tmp_path: Path,
+) -> None:
+    from eventlake.storage import LocalStorage
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        compact(None, "ping", "2026-01-01", storage=LocalStorage(tmp_path))
+    message = str(excinfo.value)
+    assert "None" not in message
+    assert str(tmp_path / "ping" / "dt=2026-01-01") in message
+
+
+def test_compact_missing_partition_message_names_the_s3_location(
+    lake_root: str | Path,
+) -> None:
+    with pytest.raises(FileNotFoundError) as excinfo:
+        compact(lake_root, "ping", "2026-01-01")
+    assert open_storage(lake_root).uri("ping/dt=2026-01-01") in str(excinfo.value)

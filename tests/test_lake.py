@@ -333,3 +333,30 @@ def test_state_as_of_tie_break_by_event_id_when_occurred_and_recorded_match(
     result = lake.state_as_of("reading", key="sensor_id").to_arrow_table()
     # occurred_at and recorded_at both tie exactly; event_id DESC decides.
     assert result.column("value").to_pylist() == [2.0]
+
+
+def test_the_view_does_not_read_partition_directories_that_are_not_dates(
+    lake_root: str | Path,
+) -> None:
+    with Writer(lake_root) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+
+    # Not Parquet: reading any of these would raise.
+    store = open_storage(lake_root)
+    store.put_atomic("ping/dt=not-a-date/part-junk.parquet", b"not parquet")
+    store.put_atomic("ping/dt=2026-1-1/part-junk.parquet", b"not parquet")
+    store.put_atomic("ping/dt=2026-01-01x/part-junk.parquet", b"not parquet")
+
+    lake = Lake(lake_root)
+    assert lake.sql("SELECT source FROM ping").fetchall() == [("a",)]
+
+
+def test_the_view_still_sees_files_written_after_the_lake_was_opened(
+    lake_root: str | Path,
+) -> None:
+    with Writer(lake_root) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 1), source="a"))
+    lake = Lake(lake_root)
+    with Writer(lake_root) as writer:
+        writer.write(Ping(occurred_at=utc(2026, 1, 2), source="b"))
+    assert sorted(lake.sql("SELECT source FROM ping").fetchall()) == [("a",), ("b",)]
