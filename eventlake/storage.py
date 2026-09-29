@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -178,6 +179,12 @@ def resolve_storage(root: str | Path | None, storage: Storage | None) -> Storage
 # refused before anything is sent.
 _MAX_SINGLE_PUT_BYTES = 5 * 1024**3
 
+# A 409 ConditionalRequestConflict means "another write to this key is in
+# flight, retry" - not "the key exists". put_exclusive retries this many
+# times, waiting a little longer each time, before giving the error up.
+_MAX_CONFLICT_RETRIES = 5
+_CONFLICT_BACKOFF_SECONDS = 0.05
+
 _BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 _IPV4_LIKE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
 # Names S3 reserves for its own resource types (access points, Object Lambda,
@@ -291,21 +298,28 @@ class S3Storage:
         from botocore.exceptions import ClientError
 
         _validate_key(key)
-        try:
-            self._client.put_object(
-                Bucket=self._bucket, Key=self._full_key(key), Body=data, IfNoneMatch="*"
-            )
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code")
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            # 412: the object already exists. 409: another conditional write
-            # to the same key is in flight - either way we did not claim it.
-            if code in ("PreconditionFailed", "ConditionalRequestConflict") or status in (
-                409,
-                412,
-            ):
-                raise FileExistsError(key) from exc
-            raise
+        for attempt in range(_MAX_CONFLICT_RETRIES + 1):
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket, Key=self._full_key(key), Body=data, IfNoneMatch="*"
+                )
+                return
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if code == "PreconditionFailed" or status == 412:
+                    # The object already exists: we did not claim it.
+                    raise FileExistsError(key) from exc
+                if (
+                    code == "ConditionalRequestConflict" or status == 409
+                ) and attempt < _MAX_CONFLICT_RETRIES:
+                    # 409 is not "it exists": another write to this key was in
+                    # flight at that instant and S3 says to try again. The
+                    # retry then sees either our claim going through or a 412.
+                    time.sleep(_CONFLICT_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def read_bytes(self, key: str) -> bytes:
         from botocore.exceptions import ClientError

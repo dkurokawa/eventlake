@@ -328,16 +328,67 @@ class _StubClient:
         raise self._error
 
 
-@pytest.mark.parametrize(
-    ("code", "status"),
-    [("PreconditionFailed", 412), ("ConditionalRequestConflict", 409), ("Whatever", 412)],
-)
-def test_s3_put_exclusive_maps_conditional_failures_to_file_exists(code: str, status: int) -> None:
+@pytest.mark.parametrize(("code", "status"), [("PreconditionFailed", 412), ("Whatever", 412)])
+def test_s3_put_exclusive_maps_a_412_to_file_exists(code: str, status: int) -> None:
     stub = _StubClient(_client_error(code, status))
     store = S3Storage("some-bucket", "lake", client=stub)  # type: ignore[arg-type]
     with pytest.raises(FileExistsError):
         store.put_exclusive("s/v1.json", b"x")
+    assert len(stub.calls) == 1  # a 412 is final: no retry
     assert stub.calls[0]["IfNoneMatch"] == "*"
+
+
+class _ScriptedClient:
+    """Answers put_object from a list: an Exception is raised, anything else succeeds."""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    def put_object(self, **kwargs: Any) -> None:
+        self.calls += 1
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    recorded: list[float] = []
+    monkeypatch.setattr(storage_module.time, "sleep", recorded.append)
+    return recorded
+
+
+def test_s3_put_exclusive_retries_a_409_and_then_succeeds(sleeps: list[float]) -> None:
+    conflict = _client_error("ConditionalRequestConflict", 409)
+    client = _ScriptedClient([conflict, conflict, "ok"])
+    store = S3Storage("some-bucket", "lake", client=client)  # type: ignore[arg-type]
+    store.put_exclusive("s/v1.json", b"x")  # claimed after two conflicts
+    assert client.calls == 3
+    assert sleeps == pytest.approx([0.05, 0.10])
+
+
+def test_s3_put_exclusive_retried_409_then_412_means_the_key_exists(sleeps: list[float]) -> None:
+    client = _ScriptedClient(
+        [_client_error("ConditionalRequestConflict", 409), _client_error("PreconditionFailed", 412)]
+    )
+    store = S3Storage("some-bucket", "lake", client=client)  # type: ignore[arg-type]
+    with pytest.raises(FileExistsError):
+        store.put_exclusive("s/v1.json", b"x")
+    assert client.calls == 2
+
+
+def test_s3_put_exclusive_gives_up_on_a_persistent_409_with_the_original_error(
+    sleeps: list[float],
+) -> None:
+    conflict = _client_error("ConditionalRequestConflict", 409)
+    client = _ScriptedClient([conflict] * 6)
+    store = S3Storage("some-bucket", "lake", client=client)  # type: ignore[arg-type]
+    with pytest.raises(type(conflict)) as excinfo:
+        store.put_exclusive("s/v1.json", b"x")
+    assert excinfo.value is conflict  # not converted to FileExistsError
+    assert client.calls == 6  # the first try plus five retries
+    assert sleeps == pytest.approx([0.05, 0.10, 0.15, 0.20, 0.25])
 
 
 def test_s3_put_exclusive_lets_other_errors_through() -> None:

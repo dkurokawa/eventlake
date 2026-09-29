@@ -258,7 +258,7 @@ same results. The rest of this section is what differs.
   | Guarantee | Local root | S3 root |
   |---|---|---|
   | A reader never sees a partly written Parquet file | temp file, then rename | one `PutObject` per file (an object appears whole or not at all); files are serialized in memory first |
-  | A schema version is never overwritten by a concurrent `Writer` | exclusive create (`os.link`) | `PutObject` with `If-None-Match: *` (S3 conditional writes); a `412` or `409` response means someone else claimed the version, and registration retries |
+  | A schema version is never overwritten by a concurrent `Writer` | exclusive create (`os.link`) | `PutObject` with `If-None-Match: *` (S3 conditional writes); a `412` response means the version already exists, and registration retries with the next number; a `409` (another write to that key was in flight) is retried on the spot, up to five times with a short wait, before its error is raised |
   | Reading, `describe()` and `compact()` give the same results | - | tested with the same test suite on both |
   | A lake written locally can be uploaded (`aws s3 sync`) and read | - | tested: local files copied object-for-object, then read through `s3://` |
   | The layout is plain Hive partitioning | yes | the same keys under the prefix |
