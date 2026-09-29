@@ -1,0 +1,441 @@
+"""Where an eventlake root physically lives.
+
+Every module that touches files goes through a `Storage`, so the same
+Writer / SchemaRegistry / Lake / compact code runs against a local
+directory or (see `S3Storage`) an object store. Paths handed to a Storage
+are always *keys*: `/`-separated strings relative to the root.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
+from urllib.parse import urlparse
+
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
+
+class Storage(Protocol):
+    """The file operations eventlake needs, and nothing more."""
+
+    def uri(self, key: str) -> str:
+        """The absolute path / URI DuckDB should use to read `key` (globs allowed)."""
+        ...
+
+    def put_atomic(self, key: str, data: bytes) -> None:
+        """Write `key` so that a reader sees all of it or none of it."""
+        ...
+
+    def put_exclusive(self, key: str, data: bytes) -> None:
+        """Create `key` only if absent; raise FileExistsError otherwise. Never overwrites."""
+        ...
+
+    def read_bytes(self, key: str) -> bytes:
+        """Return the content of `key`; FileNotFoundError if there is none."""
+        ...
+
+    def list_keys(self, prefix: str) -> list[str]:
+        """Every key under `prefix` (recursive), sorted. Temporary files are not listed."""
+        ...
+
+    def delete(self, key: str) -> None:
+        """Remove `key`; failure is an OSError (compact() reports it, not swallows it)."""
+        ...
+
+    def configure_duckdb(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Make `uri(...)` readable from `con` (credentials, extensions)."""
+        ...
+
+
+def _validate_key(key: str, *, allow_empty: bool = False) -> None:
+    """Reject keys that could point outside the root.
+
+    A key is built from an already-validated event_type / dt, so this is a
+    second line of defence: `..` and `.` segments are refused outright, and
+    so are empty segments (`a//b`), which mean different things to different
+    backends.
+    """
+    if key == "" and allow_empty:
+        return
+    segments = key.split("/")
+    if key.endswith("/") and allow_empty:
+        segments = segments[:-1]
+    if not segments or any(s in ("", ".", "..") for s in segments):
+        raise ValueError(f"invalid storage key: {key!r}")
+
+
+def table_to_parquet_bytes(table: pa.Table) -> bytes:
+    """Serialize `table` to a complete Parquet file in memory."""
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    return bytes(sink.getvalue().to_pybytes())
+
+
+class LocalStorage:
+    """A root on the local filesystem."""
+
+    def __init__(self, root: str | Path) -> None:
+        self._root = Path(root)
+
+    def _path(self, key: str) -> Path:
+        _validate_key(key)
+        return self._root.joinpath(*key.split("/"))
+
+    def uri(self, key: str) -> str:
+        # Not validated: callers pass globs (`dt=*`) built from checked parts.
+        return str(self._root.joinpath(*key.split("/")))
+
+    def put_atomic(self, key: str, data: bytes) -> None:
+        # A failed write leaves the partition directory in place even if
+        # it's now empty (this Writer just created it): removing it would
+        # race with another Writer concurrently targeting the same
+        # partition - it could rmdir the directory in the moment between
+        # that other Writer's mkdir(exist_ok=True) no-op and its own write,
+        # pulling the directory out from under a write that was otherwise
+        # fine. An empty (or nonexistent) partition directory is already
+        # invisible to Lake (see Lake._event_types), so there's nothing to
+        # clean up here that matters.
+        final_path = self._path(key)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = final_path.parent / f".{final_path.name}.tmp"
+        try:
+            tmp_path.write_bytes(data)
+            tmp_path.rename(final_path)
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def put_exclusive(self, key: str, data: bytes) -> None:
+        # Write the full content to a uniquely-named temp file first, then
+        # atomically claim the target name with `os.link` (which fails with
+        # FileExistsError if the target already exists, and never overwrites
+        # it) - so a reader only ever sees the target absent or complete, and
+        # two concurrent callers can't silently clobber each other.
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        tmp_path.write_bytes(data)
+        try:
+            os.link(tmp_path, path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._path(key).read_bytes()
+
+    def list_keys(self, prefix: str) -> list[str]:
+        _validate_key(prefix, allow_empty=True)
+        base = self._root.joinpath(*prefix.strip("/").split("/")) if prefix else self._root
+        if not base.is_dir():
+            return []
+        keys: list[str] = []
+        # followlinks: the root may contain symlinked directories, and the
+        # rest of the library (like the README says) follows them.
+        for dirpath, _dirnames, filenames in os.walk(base, followlinks=True):
+            relative_dir = Path(dirpath).relative_to(self._root)
+            for name in filenames:
+                if name.startswith("."):
+                    continue  # in-flight temp files are never part of the lake
+                keys.append("/".join((*relative_dir.parts, name)))
+        return sorted(keys)
+
+    def delete(self, key: str) -> None:
+        self._path(key).unlink()
+
+    def configure_duckdb(self, con: duckdb.DuckDBPyConnection) -> None:
+        return None
+
+
+def open_storage(root: str | Path) -> Storage:
+    """A `Storage` for `root`: `s3://bucket/prefix` is S3, anything else a local path."""
+    if isinstance(root, str) and root.startswith("s3://"):
+        return S3Storage.from_uri(root)
+    return LocalStorage(root)
+
+
+def resolve_storage(root: str | Path | None, storage: Storage | None) -> Storage:
+    """The `Storage` for a `root` / `storage=` argument pair (exactly one)."""
+    if storage is not None:
+        if root is not None:
+            raise ValueError("pass either a root or storage=, not both")
+        return storage
+    if root is None:
+        raise ValueError("a root or storage= is required")
+    return open_storage(root)
+
+
+# S3 rejects a single PutObject above 5 GB. Parquet files are serialized in
+# memory and written with one PutObject (no multipart upload - a multipart
+# upload can leave a half-finished object behind), so a larger table is
+# refused before anything is sent.
+_MAX_SINGLE_PUT_BYTES = 5 * 1024**3
+
+# A 409 ConditionalRequestConflict means "another write to this key is in
+# flight, retry" - not "the key exists". put_exclusive retries this many
+# times, waiting a little longer each time, before giving the error up.
+_MAX_CONFLICT_RETRIES = 5
+_CONFLICT_BACKOFF_SECONDS = 0.05
+
+_BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+_IPV4_LIKE = re.compile(r"[0-9]{1,3}(\.[0-9]{1,3}){3}")
+# Names S3 reserves for its own resource types (access points, Object Lambda,
+# S3 on Outposts, directory buckets, multi-region access points).
+_RESERVED_BUCKET_PREFIXES = ("xn--", "sthree-", "amzn-s3-demo-")
+_RESERVED_BUCKET_SUFFIXES = ("-s3alias", "--ol-s3", "--x-s3", "--table-s3", ".mrap")
+# The public AWS S3 endpoints: s3.amazonaws.com, s3.<region>.amazonaws.com,
+# s3-<region>.amazonaws.com, s3.dualstack.<region>.amazonaws.com, and the same
+# under amazonaws.com.cn. Anything else (VPC endpoints, moto, MinIO) is
+# addressed explicitly.
+_STANDARD_AWS_HOST = re.compile(
+    r"s3(\.dualstack\.[a-z0-9-]+|[.-][a-z0-9-]+)?\.amazonaws\.com(\.cn)?"
+)
+# DuckDB expands these in any file name it is given (read_parquet('...')), so a
+# prefix containing one could make it read a different prefix than the one
+# that was asked for.
+_GLOB_CHARACTERS = frozenset("*?[]{}")
+
+
+def _validate_bucket(bucket: str) -> None:
+    if (
+        _BUCKET_PATTERN.fullmatch(bucket) is None
+        or ".." in bucket
+        or _IPV4_LIKE.fullmatch(bucket) is not None
+        or bucket.startswith(_RESERVED_BUCKET_PREFIXES)
+        or bucket.endswith(_RESERVED_BUCKET_SUFFIXES)
+    ):
+        raise ValueError(f"invalid S3 bucket name: {bucket!r}")
+
+
+def _validate_prefix(prefix: str) -> None:
+    """`prefix` has no trailing `/`; empty means the bucket root."""
+    if not prefix:
+        return
+    if any(segment in ("", ".", "..") for segment in prefix.split("/")):
+        raise ValueError(
+            f"invalid S3 prefix {prefix!r}: '.', '..' and empty segments are not allowed"
+        )
+    if _GLOB_CHARACTERS & set(prefix):
+        raise ValueError(
+            f"invalid S3 prefix {prefix!r}: the characters * ? [ ] {{ }} are not allowed "
+            "(DuckDB would expand them as wildcards)"
+        )
+
+
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    """Split `s3://<bucket>/<prefix>` into `(bucket, prefix)`, validating both.
+
+    The prefix loses one trailing `/`; an empty prefix (the bucket root) is
+    allowed. `.`, `..` and empty segments (`a//b`) are rejected: they mean
+    different things to different tools and none of them belong in a root.
+    So are glob characters in the prefix (see `_GLOB_CHARACTERS`).
+    """
+    if not uri.startswith("s3://"):
+        raise ValueError(f"not an s3:// URI: {uri!r}")
+    bucket, _, prefix = uri[len("s3://") :].partition("/")
+    if prefix.endswith("/"):
+        prefix = prefix[:-1]
+    _validate_bucket(bucket)
+    _validate_prefix(prefix)
+    return bucket, prefix
+
+
+class S3Storage:
+    """A root under `s3://<bucket>/<prefix>`, accessed with boto3.
+
+    Needs the `s3` extra (`pip install 'eventlake[s3]'`). boto3 is imported
+    here and nowhere else, so local use never loads it.
+    """
+
+    def __init__(self, bucket: str, prefix: str = "", *, client: S3Client | None = None) -> None:
+        # Validated here too, not only in parse_s3_uri: constructing the class
+        # directly must not be a way around the checks.
+        _validate_bucket(bucket)
+        _validate_prefix(prefix)
+        self._bucket = bucket
+        self._prefix = prefix
+        if client is None:
+            try:
+                import boto3
+            except ImportError as exc:
+                raise ImportError(
+                    "S3 support needs the 's3' extra: pip install 'eventlake[s3]'"
+                ) from exc
+            client = boto3.client("s3")
+        self._client = client
+
+    @classmethod
+    def from_uri(cls, uri: str, *, client: S3Client | None = None) -> S3Storage:
+        bucket, prefix = parse_s3_uri(uri)
+        return cls(bucket, prefix, client=client)
+
+    def _full_key(self, key: str) -> str:
+        return f"{self._prefix}/{key}" if self._prefix else key
+
+    def uri(self, key: str) -> str:
+        return f"s3://{self._bucket}/{self._full_key(key)}"
+
+    def put_atomic(self, key: str, data: bytes) -> None:
+        _validate_key(key)
+        if len(data) > _MAX_SINGLE_PUT_BYTES:
+            raise ValueError(
+                f"{key!r} is {len(data)} bytes after serialization; a single S3 PutObject "
+                f"is limited to {_MAX_SINGLE_PUT_BYTES} bytes and eventlake does not use "
+                "multipart uploads. Flush smaller batches (lower max_rows)."
+            )
+        # One PutObject: the object appears whole or not at all.
+        self._client.put_object(Bucket=self._bucket, Key=self._full_key(key), Body=data)
+
+    def put_exclusive(self, key: str, data: bytes) -> None:
+        from botocore.exceptions import ClientError
+
+        _validate_key(key)
+        for attempt in range(_MAX_CONFLICT_RETRIES + 1):
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket, Key=self._full_key(key), Body=data, IfNoneMatch="*"
+                )
+                return
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code")
+                status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if code == "PreconditionFailed" or status == 412:
+                    # The object already exists: we did not claim it.
+                    raise FileExistsError(key) from exc
+                if (
+                    code == "ConditionalRequestConflict" or status == 409
+                ) and attempt < _MAX_CONFLICT_RETRIES:
+                    # 409 is not "it exists": another write to this key was in
+                    # flight at that instant and S3 says to try again. The
+                    # retry then sees either our claim going through or a 412.
+                    time.sleep(_CONFLICT_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def read_bytes(self, key: str) -> bytes:
+        from botocore.exceptions import ClientError
+
+        _validate_key(key)
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=self._full_key(key))
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                raise FileNotFoundError(key) from exc
+            raise
+        return bytes(response["Body"].read())
+
+    def list_keys(self, prefix: str) -> list[str]:
+        _validate_key(prefix, allow_empty=True)
+        directory = prefix if prefix == "" or prefix.endswith("/") else prefix + "/"
+        strip = f"{self._prefix}/" if self._prefix else ""
+        paginator = self._client.get_paginator("list_objects_v2")
+        keys: list[str] = []
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=strip + directory):
+            for item in page.get("Contents", []):
+                relative = item["Key"][len(strip) :]
+                if relative.rsplit("/", 1)[-1].startswith("."):
+                    continue
+                keys.append(relative)
+        return sorted(keys)
+
+    def delete(self, key: str) -> None:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        _validate_key(key)
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=self._full_key(key))
+        except (ClientError, BotoCoreError) as exc:
+            raise OSError(f"could not delete {self.uri(key)}: {exc}") from exc
+
+    def _bucket_region(self) -> str | None:
+        """The region the bucket lives in, from S3's `x-amz-bucket-region` header.
+
+        HeadBucket answers with that header even when it fails (a 301/403 for
+        a bucket in another region), so it is read from the error response too.
+        None when it cannot be found; the caller falls back to the client's.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        try:
+            response = self._client.head_bucket(Bucket=self._bucket)
+        except ClientError as exc:
+            response = cast(Any, exc.response)
+        except BotoCoreError:
+            return None
+        headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        region = headers.get("x-amz-bucket-region")
+        return region if isinstance(region, str) and region else None
+
+    def configure_duckdb(self, con: duckdb.DuckDBPyConnection) -> None:
+        """Load httpfs and hand DuckDB this client's credentials and endpoint.
+
+        The credentials are frozen at this moment (see the README's note on
+        temporary credentials). They travel inside a SQL string, so a failure
+        here is re-raised without the statement or the driver's message.
+        """
+        endpoint = urlparse(self._client.meta.endpoint_url)
+        if endpoint.path not in ("", "/"):
+            # DuckDB takes host[:port] only; a path prefix on the endpoint
+            # would be dropped and a different location read without a word.
+            raise ValueError("the S3 endpoint URL has a path, which DuckDB cannot use")
+        # botocore has no public accessor for a client's credentials; the
+        # request signer holds them (and refreshes them, for assumed roles).
+        credentials = cast(Any, self._client)._request_signer._credentials
+        if credentials is None:
+            raise RuntimeError("the boto3 client has no credentials; DuckDB cannot read S3")
+        frozen = credentials.get_frozen_credentials()
+        # DuckDB matches a scope as a plain string prefix, so it ends in `/`:
+        # otherwise `s3://b/lake` would also cover `s3://b/lakehouse/...`, and
+        # `s3://b` would cover `s3://b2/...`.
+        scope = f"s3://{self._bucket}/{self._prefix}/" if self._prefix else f"s3://{self._bucket}/"
+        options = [
+            "TYPE s3",
+            "PROVIDER config",
+            f"KEY_ID {_quote_literal(frozen.access_key)}",
+            f"SECRET {_quote_literal(frozen.secret_key)}",
+            # Only paths under this root use these credentials.
+            f"SCOPE {_quote_literal(scope)}",
+        ]
+        if frozen.token:
+            options.append(f"SESSION_TOKEN {_quote_literal(frozen.token)}")
+        if _STANDARD_AWS_HOST.fullmatch(endpoint.hostname or "") is not None:
+            # The public AWS endpoint: DuckDB derives the host from the region,
+            # which has to be the *bucket's* region, not the client's.
+            region = self._bucket_region() or self._client.meta.region_name
+            if region:
+                options.append(f"REGION {_quote_literal(region)}")
+            if "." in self._bucket:
+                # A dotted bucket name does not match the wildcard TLS
+                # certificate of virtual-hosted-style addressing.
+                options.append("URL_STYLE 'path'")
+        else:
+            # Anything else - a VPC endpoint, moto, MinIO, another
+            # S3-compatible server: use exactly the endpoint the client uses,
+            # buckets in the path.
+            region = self._client.meta.region_name
+            if region:
+                options.append(f"REGION {_quote_literal(region)}")
+            options.append(f"ENDPOINT {_quote_literal(endpoint.netloc)}")
+            options.append("URL_STYLE 'path'")
+            options.append(f"USE_SSL {'true' if endpoint.scheme == 'https' else 'false'}")
+
+        # No secret values in these two statements.
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+        try:
+            con.execute(f"CREATE OR REPLACE SECRET ({', '.join(options)})")
+        except duckdb.Error:
+            raise RuntimeError("DuckDB rejected the S3 secret configuration") from None
+
+
+def _quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"

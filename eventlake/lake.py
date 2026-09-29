@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
-import pyarrow.parquet as pq
 
-from .event import EVENT_TYPE_PATTERN, RESERVED_SOURCE_FILE_COLUMN
+from .event import RESERVED_SOURCE_FILE_COLUMN, validate_event_type
 from .schema import SchemaRegistry
+from .storage import Storage, resolve_storage
+
+# `<event_type>/dt=YYYY-MM-DD/part-<id>.parquet` - the layout Writer produces.
+_PART_KEY = re.compile(
+    r"(?P<et>[a-z][a-z0-9_]{0,63})/dt=(?P<dt>[0-9]{4}-[0-9]{2}-[0-9]{2})/part-[^/]+\.parquet"
+)
+
+
+def _is_date(value: str) -> bool:
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -38,69 +52,61 @@ def _require_aware(value: datetime | None, name: str) -> None:
 class Lake:
     """A read-only view over an eventlake root, backed by an in-memory DuckDB."""
 
-    def __init__(self, root: str | Path) -> None:
-        self._root = Path(root)
+    def __init__(self, root: str | Path | None = None, *, storage: Storage | None = None) -> None:
+        self._storage = resolve_storage(root, storage)
         self._con = duckdb.connect(database=":memory:")
         # Keep timestamps as UTC on the way out; without this the session
         # picks up the OS-local timezone and re-labels every timestamp with
         # it (same instant, misleading label).
         self._con.execute("SET TimeZone='UTC'")
-        self._registry = SchemaRegistry(self._root)
+        self._storage.configure_duckdb(self._con)
+        self._registry = SchemaRegistry(storage=self._storage)
         for event_type in self._event_types():
             self._create_view(event_type)
 
     def _event_types(self) -> list[str]:
-        """Directory names under root that look like a real, non-empty event type.
+        """Event types under the root that have at least one Parquet file.
 
-        Ignores `_schemas`, anything not matching EVENT_TYPE_PATTERN (so a
-        stray or half-named directory can't shadow it), and any event_type
-        directory that doesn't contain at least one Parquet file yet (an
-        empty `read_parquet(glob)` with no matches raises in DuckDB, so
-        these must never reach `_create_view`).
+        Ignores `_schemas` and anything not matching the layout regex (so a
+        stray or half-named directory can't shadow a real type). An event
+        type with no Parquet file yet is never listed: an empty
+        `read_parquet(glob)` with no matches raises in DuckDB, so these must
+        never reach `_create_view`.
         """
-        if not self._root.exists():
-            return []
-        result = []
-        for p in sorted(self._root.iterdir()):
-            if not p.is_dir() or p.name == "_schemas":
-                continue
-            if not EVENT_TYPE_PATTERN.fullmatch(p.name):
-                continue
-            if not any(p.glob("dt=*/part-*.parquet")):
-                continue
-            result.append(p.name)
-        return result
+        found: set[str] = set()
+        for key in self._storage.list_keys(""):
+            match = _PART_KEY.fullmatch(key)
+            if match is not None and _is_date(match.group("dt")):
+                found.add(match.group("et"))
+        return sorted(found)
 
-    def _partition_dirs(
+    def _partition_keys(
         self, event_type: str, *, since: datetime | None, until: datetime | None
-    ) -> list[Path]:
-        type_dir = self._root / event_type
-        if not type_dir.exists():
-            return []
+    ) -> dict[str, list[str]]:
+        """Parquet file keys of `event_type`, by partition date (sorted)."""
+        # Validate before the value becomes part of a key: an event_type like
+        # "../x" must never make the storage look outside the root.
+        validate_event_type(event_type)
         since_date = since.astimezone(UTC).date() if since is not None else None
         until_date = until.astimezone(UTC).date() if until is not None else None
-        result: list[Path] = []
-        for partition_dir in sorted(type_dir.glob("dt=*")):
-            if not partition_dir.is_dir():
+        partitions: dict[str, list[str]] = {}
+        for key in self._storage.list_keys(f"{event_type}/"):
+            match = _PART_KEY.fullmatch(key)
+            if match is None or not _is_date(match.group("dt")):
                 continue
-            try:
-                dt = date.fromisoformat(partition_dir.name[len("dt=") :])
-            except ValueError:
-                continue
+            dt = date.fromisoformat(match.group("dt"))
             if since_date is not None and dt < since_date:
                 continue
             if until_date is not None and dt > until_date:
                 continue
-            result.append(partition_dir)
-        return result
+            partitions.setdefault(match.group("dt"), []).append(key)
+        return partitions
 
     def _partition_files(
         self, event_type: str, *, since: datetime | None, until: datetime | None
     ) -> list[str]:
-        files: list[str] = []
-        for partition_dir in self._partition_dirs(event_type, since=since, until=until):
-            files.extend(str(p) for p in sorted(partition_dir.glob("part-*.parquet")))
-        return files
+        partitions = self._partition_keys(event_type, since=since, until=until)
+        return [self._storage.uri(key) for keys in partitions.values() for key in keys]
 
     @staticmethod
     def _from_files_expr(files: list[str]) -> str:
@@ -122,7 +128,13 @@ class Lake:
         )
 
     def _from_glob_expr(self, event_type: str) -> str:
-        pattern = str(self._root / event_type / "dt=*" / "part-*.parquet")
+        # dt is spelled out as a date shape, so a stray `dt=not-a-date/` next to
+        # the real partitions is not read (the same rule as _PART_KEY). Still a
+        # glob rather than a listing: files written after the Lake was created
+        # must show up in the view.
+        digit = "[0-9]"
+        dt = f"{digit * 4}-{digit * 2}-{digit * 2}"
+        pattern = self._storage.uri(f"{event_type}/dt={dt}/part-*.parquet")
         return (
             f"read_parquet({_quote_literal(pattern)}, union_by_name=true, "
             f"hive_partitioning=false, filename={_quote_literal(RESERVED_SOURCE_FILE_COLUMN)})"
@@ -234,18 +246,25 @@ class Lake:
         """Per event type: schema version count, partition count, file count, row count."""
         summaries: list[TypeSummary] = []
         for event_type in self._event_types():
-            partition_dirs = self._partition_dirs(event_type, since=None, until=None)
-            files: list[Path] = []
-            for partition_dir in partition_dirs:
-                files.extend(sorted(partition_dir.glob("part-*.parquet")))
-            rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+            partitions = self._partition_keys(event_type, since=None, until=None)
+            uris = [self._storage.uri(key) for keys in partitions.values() for key in keys]
             summaries.append(
                 TypeSummary(
                     event_type=event_type,
                     schema_versions=len(self._registry.versions(event_type)),
-                    partitions=len(partition_dirs),
-                    files=len(files),
-                    rows=rows,
+                    partitions=len(partitions),
+                    files=len(uris),
+                    rows=self._count_rows(uris),
                 )
             )
         return summaries
+
+    def _count_rows(self, uris: list[str]) -> int:
+        # Footer metadata only - no row data is read - and the same path for
+        # every storage backend.
+        file_list = ", ".join(_quote_literal(u) for u in uris)
+        row = self._con.execute(
+            f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_file_metadata([{file_list}])"
+        ).fetchone()
+        assert row is not None
+        return int(row[0])

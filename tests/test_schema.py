@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
+from _helpers import keys
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -82,11 +83,11 @@ def test_diff_schemas_tightening_nullability_is_incompatible() -> None:
     assert not diff.is_compatible()
 
 
-def test_registry_rejects_unsafe_event_type_even_called_directly(tmp_path: Path) -> None:
+def test_registry_rejects_unsafe_event_type_even_called_directly(lake_root: str | Path) -> None:
     """K2: SchemaRegistry validates event_type itself, so calling it
     directly (bypassing Event's own class-definition-time check) still
     can't write outside the root."""
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     with pytest.raises(ValueError, match="invalid event_type"):
         registry.register("../escape", BASE_SCHEMA, allow_breaking=False)
     with pytest.raises(ValueError, match="invalid event_type"):
@@ -95,19 +96,20 @@ def test_registry_rejects_unsafe_event_type_even_called_directly(tmp_path: Path)
         registry.latest("/abs/path")
 
     # Nothing should have been written anywhere outside (or even inside) root.
-    assert not (tmp_path.parent / "escape").exists()
-    assert list(tmp_path.iterdir()) == []
+    assert keys(lake_root) == []
+    if isinstance(lake_root, Path):
+        assert not (lake_root.parent / "escape").exists()
 
 
-def test_registry_first_registration_creates_v1(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_first_registration_creates_v1(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     result = registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     assert result.version == 1
     assert registry.versions("widget") == [1]
 
 
-def test_registry_no_change_reuses_version(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_no_change_reuses_version(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     result = registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     assert result.version == 1
@@ -115,12 +117,12 @@ def test_registry_no_change_reuses_version(tmp_path: Path) -> None:
 
 
 def test_registry_reuses_an_exact_match_against_an_older_version_not_just_latest(
-    tmp_path: Path,
+    lake_root: str | Path,
 ) -> None:
     """K5: registering v1's exact schema again, after v2 already exists and
     is the latest, must reuse v1 - not diff v1's schema against v2 (which
     would look like an incompatible field removal) and raise."""
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
     new_schema = BASE_SCHEMA.append(pa.field("note", pa.string(), nullable=True))
     registry.register("widget", new_schema, allow_breaking=False)  # v2
@@ -130,8 +132,8 @@ def test_registry_reuses_an_exact_match_against_an_older_version_not_just_latest
     assert registry.versions("widget") == [1, 2]  # no new version created
 
 
-def test_registry_compatible_change_creates_new_version(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_compatible_change_creates_new_version(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     new_schema = BASE_SCHEMA.append(pa.field("note", pa.string(), nullable=True))
     result = registry.register("widget", new_schema, allow_breaking=False)
@@ -139,8 +141,8 @@ def test_registry_compatible_change_creates_new_version(tmp_path: Path) -> None:
     assert registry.versions("widget") == [1, 2]
 
 
-def test_registry_incompatible_change_raises_without_allow_breaking(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_incompatible_change_raises_without_allow_breaking(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     new_schema = pa.schema([f for f in BASE_SCHEMA if f.name != "score"])
     with pytest.raises(SchemaChangeError) as exc_info:
@@ -150,9 +152,9 @@ def test_registry_incompatible_change_raises_without_allow_breaking(tmp_path: Pa
 
 
 def test_registry_incompatible_change_allowed_with_allow_breaking(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    lake_root: str | Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     new_schema = pa.schema([f for f in BASE_SCHEMA if f.name != "score"])
     with caplog.at_level(logging.WARNING):
@@ -162,23 +164,23 @@ def test_registry_incompatible_change_allowed_with_allow_breaking(
     assert any("breaking schema change" in message for message in caplog.messages)
 
 
-def test_registry_load_round_trips_schema_with_list_field(tmp_path: Path) -> None:
+def test_registry_load_round_trips_schema_with_list_field(lake_root: str | Path) -> None:
     schema_with_list = BASE_SCHEMA.append(pa.field("tags", pa.list_(pa.string()), nullable=True))
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", schema_with_list, allow_breaking=False)
     loaded = registry.load("widget", 1)
     assert loaded.schema.equals(schema_with_list)
 
 
-def test_registry_latest_returns_none_when_unregistered(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_latest_returns_none_when_unregistered(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     assert registry.latest("nonexistent") is None
     assert registry.versions("nonexistent") == []
     assert registry.all("nonexistent") == []
 
 
-def test_registry_all_returns_ordered_versions(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_registry_all_returns_ordered_versions(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)
     new_schema = BASE_SCHEMA.append(pa.field("note", pa.string(), nullable=True))
     registry.register("widget", new_schema, allow_breaking=False)
@@ -191,8 +193,8 @@ def test_registry_all_returns_ordered_versions(tmp_path: Path) -> None:
 # --- H3: version files are claimed exclusively, with retry on collision ----
 
 
-def test_write_never_overwrites_an_existing_version_file(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_write_never_overwrites_an_existing_version_file(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
 
     # v1 already exists: a second _write for the same version must fail
@@ -212,8 +214,8 @@ def test_write_never_overwrites_an_existing_version_file(tmp_path: Path) -> None
     }
 
 
-def test_register_retries_when_target_version_already_exists(tmp_path: Path) -> None:
-    registry = SchemaRegistry(tmp_path)
+def test_register_retries_when_target_version_already_exists(lake_root: str | Path) -> None:
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
 
     concurrent_schema = BASE_SCHEMA.append(pa.field("other", pa.string(), nullable=True))
@@ -249,9 +251,9 @@ def test_register_retries_when_target_version_already_exists(tmp_path: Path) -> 
 
 
 def test_register_gives_up_after_max_attempts_under_permanent_contention(
-    tmp_path: Path,
+    lake_root: str | Path,
 ) -> None:
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
 
     def always_taken(
@@ -267,12 +269,12 @@ def test_register_gives_up_after_max_attempts_under_permanent_contention(
 
 
 def test_two_threads_registering_different_compatible_schemas_lose_nothing(
-    tmp_path: Path,
+    lake_root: str | Path,
 ) -> None:
     """A real concurrency test: two threads race to claim v2 for real."""
     import threading
 
-    registry = SchemaRegistry(tmp_path)
+    registry = SchemaRegistry(lake_root)
     registry.register("widget", BASE_SCHEMA, allow_breaking=False)  # v1
 
     schema_a = BASE_SCHEMA.append(pa.field("a", pa.string(), nullable=True))

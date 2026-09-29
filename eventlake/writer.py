@@ -11,10 +11,10 @@ from pathlib import Path
 from types import TracebackType
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from .event import Event, arrow_schema_for, event_to_record
 from .schema import SchemaRegistry
+from .storage import Storage, resolve_storage, table_to_parquet_bytes
 
 DEFAULT_MAX_ROWS = 10_000
 
@@ -37,15 +37,16 @@ class Writer:
 
     def __init__(
         self,
-        root: str | Path,
+        root: str | Path | None = None,
         *,
         max_rows: int = DEFAULT_MAX_ROWS,
         allow_breaking: bool = False,
+        storage: Storage | None = None,
     ) -> None:
-        self._root = Path(root)
+        self._storage = resolve_storage(root, storage)
         self._max_rows = max_rows
         self._allow_breaking = allow_breaking
-        self._registry = SchemaRegistry(self._root)
+        self._registry = SchemaRegistry(storage=self._storage)
         self._buffers: dict[type[Event], list[Event]] = defaultdict(list)
         self._seen_event_ids: set[uuid.UUID] = set()
         self._closed = False
@@ -146,23 +147,7 @@ class Writer:
             self._buffers[cls] = remaining
 
     def _write_file(self, event_type: str, dt: str, table: pa.Table) -> None:
-        # A failed write leaves the partition directory in place even if
-        # it's now empty (this Writer just created it): removing it would
-        # race with another Writer concurrently targeting the same
-        # partition - it could rmdir the directory in the moment between
-        # that other Writer's mkdir(exist_ok=True) no-op and its own write,
-        # pulling the directory out from under a write that was otherwise
-        # fine. An empty (or nonexistent) partition directory is already
-        # invisible to Lake (see Lake._event_types), so there's nothing to
-        # clean up here that matters.
-        partition_dir = self._root / event_type / f"dt={dt}"
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"part-{uuid.uuid4()}.parquet"
-        final_path = partition_dir / filename
-        tmp_path = partition_dir / f".{filename}.tmp"
-        try:
-            pq.write_table(table, tmp_path)
-            tmp_path.rename(final_path)
-        except BaseException:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        # event_type comes from Event.__init_subclass__'s validated pattern
+        # and dt from a date's isoformat(), so the key can't leave the root.
+        key = f"{event_type}/dt={dt}/part-{uuid.uuid4()}.parquet"
+        self._storage.put_atomic(key, table_to_parquet_bytes(table))
