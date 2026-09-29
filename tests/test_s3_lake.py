@@ -116,6 +116,9 @@ def _fake_client(
     """`head_bucket`: "ok" answers with the bucket's region header, "redirect"
     fails with a 301 that carries the header, "no-header" answers without it,
     "offline" fails with a connection error."""
+    if "amazonaws.com" in endpoint:
+        # The AWS path looks the bucket's region up, which imports botocore.
+        pytest.importorskip("botocore")
     frozen = SimpleNamespace(access_key="AKIDEXAMPLE", secret_key=_SECRET, token=token)
     creds = SimpleNamespace(get_frozen_credentials=lambda: frozen) if credentials else None
     headers = {"x-amz-bucket-region": bucket_region} if bucket_region else {}
