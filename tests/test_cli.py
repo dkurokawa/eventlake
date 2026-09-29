@@ -86,6 +86,16 @@ def test_schema_command_shows_versions_and_diff(
     assert "+ note" in out
 
 
+@pytest.mark.parametrize("command", ["describe", "compact", "schema"])
+def test_help_says_the_root_may_be_an_s3_uri(
+    command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([command, "--help"])
+    assert excinfo.value.code == 0
+    assert "s3://bucket/prefix" in " ".join(capsys.readouterr().out.split())
+
+
 def test_main_requires_a_command(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         main([])

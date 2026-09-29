@@ -60,22 +60,25 @@ def _cmd_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+_ROOT_HELP = "lake root: a directory, or s3://bucket/prefix (needs the 's3' extra)"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="eventlake")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     describe_parser = subparsers.add_parser("describe", help="summarize each event type")
-    describe_parser.add_argument("root")
+    describe_parser.add_argument("root", help=_ROOT_HELP)
     describe_parser.set_defaults(func=_cmd_describe)
 
     compact_parser = subparsers.add_parser("compact", help="compact one partition's files")
-    compact_parser.add_argument("root")
+    compact_parser.add_argument("root", help=_ROOT_HELP)
     compact_parser.add_argument("event_type")
     compact_parser.add_argument("dt", help="partition date, YYYY-MM-DD")
     compact_parser.set_defaults(func=_cmd_compact)
 
     schema_parser = subparsers.add_parser("schema", help="show schema version history")
-    schema_parser.add_argument("root")
+    schema_parser.add_argument("root", help=_ROOT_HELP)
     schema_parser.add_argument("event_type")
     schema_parser.set_defaults(func=_cmd_schema)
 
