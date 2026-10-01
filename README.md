@@ -25,6 +25,14 @@ events, and never mutates what it's already written:
 - Reading goes through DuckDB, so "what was true as of a given moment" is a
   query, not a re-implementation of your event log's replay logic.
 
+## Architecture
+
+![architecture](docs/architecture.svg)
+
+`Writer` validates each event with pydantic, buffers it per event class, and flushes date-partitioned Parquet to a local directory or S3. `SchemaRegistry` checks every change against the stored versions. `Lake` reads through DuckDB (dedup by `event_id`, `state_as_of`); other readers (DuckDB, Athena, Spark) can open the Hive layout directly.
+
+構成図: アプリ → `Writer` → 保存先（ローカルまたは S3）→ `Lake`（DuckDB）。`SchemaRegistry` が版を管理する。
+
 ## Install
 
 Requires Python 3.11+. This repo is managed with [uv](https://docs.astral.sh/uv/):
